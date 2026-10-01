@@ -249,9 +249,23 @@ export default function Dashboard() {
 
   const [scans, setScans] = useState([]);
   const [profile, setProfile] = useState(null);
+  const [user, setUser] = useState(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+
+
+useEffect(() => {
+  try {
+    const storedUser = localStorage.getItem("user");
+
+    if (storedUser) {
+      setUser(JSON.parse(storedUser));
+    }
+  } catch (error) {
+    console.error("Failed to load user:", error);
+  }
+}, []);
 
   // ============================================================
   // FETCH DASHBOARD DATA
@@ -537,6 +551,10 @@ export default function Dashboard() {
     };
   }, [healthScore]);
 
+
+  const firstName =
+  user?.name?.trim()?.split(" ")[0] || "there";
+
   // ============================================================
   // LOADING
   // ============================================================
@@ -581,7 +599,7 @@ export default function Dashboard() {
             </div>
 
             <h1 className="text-2xl font-bold tracking-tight text-white sm:text-3xl">
-              Good morning, Aditya
+              Good morning, {firstName}
               <span className="ml-2">👋</span>
             </h1>
 
