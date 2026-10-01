@@ -9,11 +9,14 @@ const scanProduct = async (req, res) => {
             });
         }
 
-        const result = await scanService.analyzeImage(req.file);
+        const result = await scanService.analyzeImage(
+            req.file,
+            req.user.userId
+        );
 
         return res.status(200).json({
             success: true,
-            message: "Image analyzed successfully",
+            message: "Image analyzed and saved successfully",
             data: result,
         });
     } catch (error) {
@@ -23,7 +26,9 @@ const scanProduct = async (req, res) => {
             return res.status(502).json({
                 success: false,
                 message: "AI service failed",
-                error: error.response.data?.detail || error.message,
+                error:
+                    error.response.data?.detail ||
+                    error.message,
             });
         }
 
@@ -34,6 +39,64 @@ const scanProduct = async (req, res) => {
     }
 };
 
+const getScanHistory = async (req, res) => {
+    try {
+        const scans = await scanService.getScanHistory(
+            req.user.userId
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: "Scan history fetched successfully",
+            data: scans,
+        });
+    } catch (error) {
+        console.error(
+            "Get scan history error:",
+            error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch scan history",
+        });
+    }
+};
+
+const getScanById = async (req, res) => {
+    try {
+        const scan = await scanService.getScanById(
+            req.user.userId,
+            req.params.id
+        );
+
+        if (!scan) {
+            return res.status(404).json({
+                success: false,
+                message: "Scan not found",
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Scan fetched successfully",
+            data: scan,
+        });
+    } catch (error) {
+        console.error(
+            "Get scan by ID error:",
+            error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch scan",
+        });
+    }
+};
+
 module.exports = {
     scanProduct,
+    getScanHistory,
+    getScanById,
 };

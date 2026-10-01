@@ -1,0 +1,69 @@
+[
+  {
+    "ingredient": "E621",
+    "aliases": [
+      "monosodium glutamate",
+      "MSG",
+      "621"
+    ],
+    "category": "flavour enhancer",
+    "description": "Monosodium glutamate (MSG) is the sodium salt of glutamic acid and is used as a flavour enhancer in foods.",
+    "health_context": "FDA states that added MSG is generally recognized as safe (GRAS). Some people report sensitivity, although FDA notes that studies have not consistently reproduced reactions.",
+    "label_guidance": "Added MSG must be declared as monosodium glutamate on the ingredient label according to FDA information.",
+    "source_name": "U.S. FDA",
+    "source_url": "https://www.fda.gov/food/food-additives-petitions/questions-and-answers-monosodium-glutamate-msg"
+  },
+  {
+    "ingredient": "E211",
+    "aliases": [
+      "sodium benzoate",
+      "benzoic acid sodium salt",
+      "211"
+    ],
+    "category": "preservative",
+    "description": "Sodium benzoate is a food substance used for technical effects including antimicrobial and antioxidant functions.",
+    "health_context": "FDA's Substances Added to Food database lists sodium benzoate and its permitted regulatory references. Its actual use depends on the applicable food category and regulations.",
+    "label_guidance": "When sodium benzoate is present, it can appear in the ingredient list under its declared ingredient name.",
+    "source_name": "U.S. FDA",
+    "source_url": "https://hfpappexternal.fda.gov/scripts/fdcc/index.cfm?id=SODIUMBENZOATE&set=FoodSubstances"
+  },
+  {
+    "ingredient": "BHA",
+    "aliases": [
+      "butylated hydroxyanisole",
+      "butyl hydroxyanisole",
+      "E320"
+    ],
+    "category": "antioxidant",
+    "description": "Butylated hydroxyanisole (BHA) is a chemical preservative used to help prevent spoilage of fats and oils.",
+    "health_context": "FDA currently lists BHA among substances under post-market scientific assessment. FDA states that BHA was previously listed as GRAS and approved as a food additive, while its current safety is being reassessed.",
+    "label_guidance": "BHA may appear on food labels as BHA or butylated hydroxyanisole.",
+    "source_name": "U.S. FDA",
+    "source_url": "https://www.fda.gov/news-events/press-announcements/fda-launches-assessment-bha-common-food-chemical-preservative"
+  },
+  {
+    "ingredient": "Maltodextrin",
+    "aliases": [
+      "maltodextrin"
+    ],
+    "category": "carbohydrate ingredient",
+    "description": "Maltodextrin is a carbohydrate ingredient produced from starch and is used in many processed foods.",
+    "health_context": "The presence of maltodextrin indicates a carbohydrate-containing ingredient. LabelIQ should use the nutrition label and user-specific thresholds rather than making a medical claim from the ingredient alone.",
+    "label_guidance": "Maltodextrin should be treated as an ingredient when explicitly present in the ingredient list.",
+    "source_name": "LabelIQ knowledge base",
+    "source_url": "https://fssai.gov.in/standards/product-standards"
+  },
+  {
+    "ingredient": "Palm Oil",
+    "aliases": [
+      "palm oil",
+      "palmolein"
+    ],
+    "category": "vegetable oil",
+    "description": "Palm oil is a vegetable oil used as an ingredient in food products.",
+    "health_context": "The presence of palm oil alone does not determine whether a product is healthy or unhealthy. LabelIQ should evaluate it according to the user's configured preferences and the overall nutritional profile.",
+    "label_guidance": "Palm oil should be reported when explicitly listed in the ingredient declaration.",
+    "source_name": "LabelIQ knowledge base",
+    "source_url": "https://fssai.gov.in/standards/product-standards"
+  }
+]

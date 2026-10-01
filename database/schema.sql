@@ -126,6 +126,26 @@ CREATE TABLE ingredients (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE ingredient_rules (
+    id BIGSERIAL PRIMARY KEY,
+
+    rule_code VARCHAR(100) NOT NULL UNIQUE,
+
+    rule_name VARCHAR(255) NOT NULL,
+
+    rule_type VARCHAR(50) NOT NULL,
+
+    pattern VARCHAR(255) NOT NULL,
+
+    severity VARCHAR(20) NOT NULL,
+
+    score_penalty DECIMAL(5,2) NOT NULL DEFAULT 0,
+
+    explanation TEXT,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE scan_ingredients (
     id BIGSERIAL PRIMARY KEY,
 
@@ -212,6 +232,68 @@ CREATE TABLE rule_matches (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- SELECT table_name
--- FROM information_schema.tables
--- WHERE table_schema = 'public';
+
+INSERT INTO ingredient_rules (
+    rule_code,
+    rule_name,
+    rule_type,
+    pattern,
+    severity,
+    score_penalty,
+    explanation
+)
+VALUES
+(
+    'ADDITIVE_E621',
+    'MSG / Monosodium Glutamate',
+    'ingredient',
+    'E621',
+    'medium',
+    10,
+    'Monosodium glutamate (MSG) detected in the ingredient list.'
+),
+(
+    'ADDITIVE_E211',
+    'Sodium Benzoate',
+    'ingredient',
+    'E211',
+    'medium',
+    10,
+    'Sodium benzoate detected in the ingredient list.'
+),
+(
+    'ADDITIVE_BHA',
+    'BHA',
+    'ingredient',
+    'BHA',
+    'high',
+    15,
+    'Butylated hydroxyanisole (BHA) detected in the ingredient list.'
+),
+(
+    'SUGAR_GLUCOS_SYRUP',
+    'Glucose Syrup',
+    'hidden_sugar',
+    'GLUCOSE SYRUP',
+    'medium',
+    10,
+    'Glucose syrup detected in the ingredient list.'
+),
+(
+    'SUGAR_MALTODEXTRIN',
+    'Maltodextrin',
+    'hidden_sugar',
+    'MALTODEXTRIN',
+    'medium',
+    10,
+    'Maltodextrin detected in the ingredient list.'
+),
+(
+    'SUGAR_HFCS',
+    'High Fructose Corn Syrup',
+    'hidden_sugar',
+    'HIGH FRUCTOSE CORN SYRUP',
+    'high',
+    15,
+    'High-fructose corn syrup detected in the ingredient list.'
+);
