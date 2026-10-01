@@ -1,7 +1,8 @@
 const axios = require("axios");
 const FormData = require("form-data");
-const mongoose = require("mongoose");
 
+
+const ScanRawData = require("../models/scanRawData.model");
 const pool = require("../config/db");
 
 
@@ -374,63 +375,24 @@ const saveRawScanData = async ({
     filename,
     aiData,
 }) => {
-
     try {
-
-        if (
-            !mongoose.connection ||
-            mongoose.connection.readyState !== 1
-        ) {
-            console.warn(
-                "MongoDB is not connected. Raw scan data was not saved."
-            );
-
-            return;
-        }
-
-
-        const collection =
-            mongoose.connection.collection(
-                "scan_raw_data"
-            );
-
-
-        await collection.insertOne({
-
-            scan_id:
-                scanId,
-
-            user_id:
-                userId,
-
-            filename:
-                filename || null,
-
-            ocr:
-                aiData?.ocr || {},
-
-            ai_analysis:
-                aiData?.ai_analysis || {},
-
-            rag:
-                aiData?.rag || {
-                    sources: [],
-                },
-
-            ai_insights:
-                aiData?.ai_insights || {},
-
-            created_at:
-                new Date(),
+        await ScanRawData.create({
+            scan_id: String(scanId),
+            user_id: String(userId),
+            filename: filename || null,
+            ocr: aiData?.ocr || {},
+            ai_analysis: aiData?.ai_analysis || {},
+            rag: aiData?.rag || {
+                sources: [],
+            },
+            ai_insights: aiData?.ai_insights || {},
+            created_at: new Date(),
         });
-
 
         console.log(
             `Raw scan data saved to MongoDB for scan ${scanId}`
         );
-
     } catch (error) {
-
         // MongoDB is used for raw/unstructured data.
         // Failure here must not invalidate a successful
         // PostgreSQL scan.
@@ -2204,43 +2166,23 @@ const getScanById = async (
         profileResult.rows[0] || null;
 
 
-    // ========================================
-    // 6. GET RAW SCAN DATA FROM MONGODB
-    // ========================================
+        
 
     let rawScanData = null;
 
-
-    try {
-
-        if (
-            mongoose.connection &&
-            mongoose.connection.readyState === 1
-        ) {
-
-            const collection =
-                mongoose.connection.collection(
-                    "scan_raw_data"
-                );
-
-
+        try {
             rawScanData =
-                await collection.findOne({
-                    scan_id:
-                        scan.scan_id,
-
-                    user_id:
-                        userId,
-                });
+                await ScanRawData.findOne({
+                    scan_id: String(scan.scan_id),
+                    user_id: String(userId),
+                }).lean();
+        } catch (error) {
+            console.error(
+                "Failed to read raw scan data from MongoDB:",
+                error.message
+            );
         }
-
-    } catch (error) {
-
-        console.error(
-            "Failed to read raw scan data from MongoDB:",
-            error.message
-        );
-    }
+    
 
 
     // ========================================
