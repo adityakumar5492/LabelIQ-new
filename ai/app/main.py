@@ -59,7 +59,8 @@ if not GROQ_API_KEY:
 # TESSERACT
 # ============================================================
 
-pytesseract.pytesseract.tesseract_cmd = (
+pytesseract.pytesseract.tesseract_cmd = os.getenv(
+    "TESSERACT_CMD",
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 )
 
