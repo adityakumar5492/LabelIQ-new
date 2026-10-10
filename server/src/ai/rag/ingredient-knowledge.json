@@ -1,0 +1,32 @@
+[
+  {
+    "name": "maltodextrin",
+    "description": "Maltodextrin is a carbohydrate made from starch. It is commonly used as a thickener, filler, or texture modifier in processed foods.",
+    "purpose": "Used to improve texture, consistency, and volume.",
+    "source": "FDA - Food Additives"
+  },
+  {
+    "name": "citric acid",
+    "description": "Citric acid is an organic acid naturally found in citrus fruits. It is commonly used in foods as an acidity regulator and preservative.",
+    "purpose": "Used to control acidity and improve flavor stability.",
+    "source": "FDA - Food Additives"
+  },
+  {
+    "name": "sodium benzoate",
+    "description": "Sodium benzoate is a preservative used to help prevent the growth of certain microorganisms in foods and beverages.",
+    "purpose": "Used to extend shelf life and preserve products.",
+    "source": "FDA - Food Additives"
+  },
+  {
+    "name": "lecithin",
+    "description": "Lecithin is a substance commonly obtained from soy or sunflower sources. It is often used as an emulsifier to help ingredients mix together.",
+    "purpose": "Used to stabilize mixtures and improve texture.",
+    "source": "FDA - Food Additives"
+  },
+  {
+    "name": "ascorbic acid",
+    "description": "Ascorbic acid is another name for vitamin C. In food products it can be used as an antioxidant and to help maintain product quality.",
+    "purpose": "Used as an antioxidant and food-quality agent.",
+    "source": "NIH - Vitamin C"
+  }
+]

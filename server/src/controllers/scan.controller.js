@@ -1,3 +1,5 @@
+"use strict";
+
 const scanService = require("../services/scan.service");
 
 const scanProduct = async (req, res) => {
@@ -22,19 +24,9 @@ const scanProduct = async (req, res) => {
     } catch (error) {
         console.error("Scan product error:", error);
 
-        if (error.response) {
-            return res.status(502).json({
-                success: false,
-                message: "AI service failed",
-                error:
-                    error.response.data?.detail ||
-                    error.message,
-            });
-        }
-
         return res.status(500).json({
             success: false,
-            message: "Internal server error",
+            message: error.message || "Failed to analyze image",
         });
     }
 };
@@ -51,10 +43,7 @@ const getScanHistory = async (req, res) => {
             data: scans,
         });
     } catch (error) {
-        console.error(
-            "Get scan history error:",
-            error
-        );
+        console.error("Get scan history error:", error);
 
         return res.status(500).json({
             success: false,
@@ -83,10 +72,7 @@ const getScanById = async (req, res) => {
             data: scan,
         });
     } catch (error) {
-        console.error(
-            "Get scan by ID error:",
-            error
-        );
+        console.error("Get scan by ID error:", error);
 
         return res.status(500).json({
             success: false,
