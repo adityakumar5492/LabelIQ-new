@@ -10,7 +10,16 @@ const knowledge = JSON.parse(
     fs.readFileSync(knowledgePath, "utf-8")
 );
 
+// A partial query (e.g. "sodium") may only match a longer knowledge
+// name (e.g. "sodium benzoate") when it covers most of that name.
+// Below this ratio the match is treated as a different ingredient.
+const MIN_PARTIAL_COVERAGE = 0.6;
+
 function normalize(text) {
+    if (typeof text !== "string") {
+        return "";
+    }
+
     return text
         .toLowerCase()
         .replace(/[()[\],.:;|/]/g, " ")
@@ -21,7 +30,24 @@ function normalize(text) {
 function cleanIngredient(ingredient) {
     return normalize(ingredient)
         .replace(/\b\d+(?:\.\d+)?\s*%\b/g, "")
+        .replace(/\s+/g, " ")
         .trim();
+}
+
+function escapeRegex(text) {
+    return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// True when `phrase` appears in `text` as whole words
+// (an optional plural "s" is allowed).
+function containsPhrase(text, phrase) {
+    if (!text || !phrase) {
+        return false;
+    }
+
+    return new RegExp(
+        `(?:^| )${escapeRegex(phrase)}s?(?: |$)`
+    ).test(text);
 }
 
 function searchKnowledge(query, topK = 3) {
@@ -42,16 +68,17 @@ function searchKnowledge(query, topK = 3) {
                 score = 100;
             }
 
-            // Query contains complete knowledge name
-            else if (
-                normalizedQuery.includes(normalizedName)
-            ) {
+            // Query contains complete knowledge name (whole words)
+            else if (containsPhrase(normalizedQuery, normalizedName)) {
                 score = 80;
             }
 
-            // Knowledge name contains complete query
+            // Knowledge name contains the complete query (whole words),
+            // only when the query covers most of the name.
             else if (
-                normalizedName.includes(normalizedQuery)
+                containsPhrase(normalizedName, normalizedQuery) &&
+                normalizedQuery.length / normalizedName.length >=
+                    MIN_PARTIAL_COVERAGE
             ) {
                 score = 70;
             }

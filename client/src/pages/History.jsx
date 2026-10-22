@@ -1,9 +1,9 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
   ArrowLeft,
   CalendarDays,
-  CheckCircle2,
+  ChevronLeft,
   ChevronRight,
   CircleAlert,
   FileSearch,
@@ -12,11 +12,32 @@ import {
   Loader2,
   RefreshCw,
   Search,
-  ShieldAlert,
   Sparkles,
   X,
 } from "lucide-react";
 import api from "../api/axios";
+
+/* =========================================================
+   Constants
+========================================================= */
+
+const PAGE_SIZE = 10;
+const SEARCH_DEBOUNCE_MS = 350;
+
+const SORT_OPTIONS = [
+  { value: "newest", label: "Newest first" },
+  { value: "oldest", label: "Oldest first" },
+  { value: "score_high", label: "Highest score" },
+  { value: "score_low", label: "Lowest score" },
+];
+
+const RANGE_OPTIONS = [
+  { value: "all", label: "All time" },
+  { value: "today", label: "Today" },
+  { value: "7d", label: "Last 7 days" },
+  { value: "30d", label: "Last 30 days" },
+  { value: "custom", label: "Custom" },
+];
 
 /* =========================================================
    Helpers
@@ -27,9 +48,7 @@ const normalizeGrade = (value) => {
 
   const grade = String(value).trim().toUpperCase();
 
-  return ["A", "B", "C", "D"].includes(grade)
-    ? grade
-    : null;
+  return ["A", "B", "C", "D"].includes(grade) ? grade : null;
 };
 
 const numberValue = (value, fallback = null) => {
@@ -73,80 +92,33 @@ const formatTime = (date) => {
   });
 };
 
-const extractScanArray = (response) => {
-  const root = response?.data;
-
-  if (Array.isArray(root?.data)) {
-    return root.data;
-  }
-
-  if (Array.isArray(root)) {
-    return root;
-  }
-
-  return [];
-};
-
 const normalizeScan = (scan) => {
   if (!scan || typeof scan !== "object") {
     return null;
   }
 
-  const grade = normalizeGrade(
-    scan.safety_grade ??
-      scan.safetyGrade
-  );
-
-  const score = numberValue(
-    scan.safety_score ??
-      scan.safetyScore
-  );
-
-  const productName =
-    scan.product_name ||
-    scan.productName ||
-    scan.name ||
-    "Food label scan";
-
   return {
-    id:
-      scan.scan_id ??
-      scan.scanId ??
-      scan.id ??
-      null,
+    id: scan.scan_id ?? scan.scanId ?? scan.id ?? null,
 
-    productName,
+    productName:
+      scan.product_name ||
+      scan.productName ||
+      scan.name ||
+      "Food label scan",
 
-    grade,
+    grade: normalizeGrade(scan.safety_grade ?? scan.safetyGrade),
 
-    score,
+    score: numberValue(scan.safety_score ?? scan.safetyScore),
 
-    createdAt:
-      scan.created_at ??
-      scan.createdAt ??
-      null,
+    createdAt: scan.created_at ?? scan.createdAt ?? null,
 
-    assessment:
-      scan.assessment ||
-      null,
+    assessment: scan.assessment || null,
 
-    scanStatus:
-      scan.scan_status ||
-      scan.scanStatus ||
-      "completed",
+    scanStatus: scan.scan_status || scan.scanStatus || "completed",
 
     hiddenSugarDetected: Boolean(
-      scan.hidden_sugar_detected ??
-        scan.hiddenSugarDetected
+      scan.hidden_sugar_detected ?? scan.hiddenSugarDetected
     ),
-
-    calories: numberValue(scan.calories),
-    protein: numberValue(scan.protein_g),
-    carbohydrates: numberValue(scan.carbohydrates_g),
-    totalFat: numberValue(scan.total_fat_g),
-    saturatedFat: numberValue(scan.saturated_fat_g),
-    sugars: numberValue(scan.total_sugars_g),
-    sodium: numberValue(scan.sodium_mg),
   };
 };
 
@@ -162,15 +134,16 @@ const gradeStyle = {
 };
 
 const statusStyle = {
-  completed:
-    "border-emerald-400/15 bg-emerald-400/10 text-emerald-300",
-
-  failed:
-    "border-red-400/15 bg-red-400/10 text-red-300",
-
-  processing:
-    "border-amber-400/15 bg-amber-400/10 text-amber-300",
+  completed: "border-emerald-400/15 bg-emerald-400/10 text-emerald-300",
+  failed: "border-red-400/15 bg-red-400/10 text-red-300",
+  processing: "border-amber-400/15 bg-amber-400/10 text-amber-300",
 };
+
+const chipActive =
+  "border-emerald-400/20 bg-emerald-400/10 text-emerald-300";
+
+const chipIdle =
+  "border-white/10 bg-white/[0.03] text-slate-500 hover:text-slate-300";
 
 /* =========================================================
    Components
@@ -207,9 +180,7 @@ function GradeBadge({ grade }) {
 function ScoreBadge({ score }) {
   if (score === null) {
     return (
-      <span className="text-xs text-slate-600">
-        Score unavailable
-      </span>
+      <span className="text-xs text-slate-600">Score unavailable</span>
     );
   }
 
@@ -223,33 +194,33 @@ function ScoreBadge({ score }) {
   );
 }
 
-function EmptyState({ hasFilters }) {
+function EmptyState({ hasFilters, onClear }) {
   return (
     <GlassCard className="p-10 sm:p-14">
       <div className="mx-auto max-w-md text-center">
         <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl border border-emerald-400/20 bg-emerald-400/10">
-          <FileSearch
-            size={28}
-            className="text-emerald-300"
-          />
+          <FileSearch size={28} className="text-emerald-300" />
         </div>
 
         <h2 className="mt-5 text-xl font-semibold text-white">
-          {hasFilters
-            ? "No matching scans"
-            : "No scan history yet"}
+          {hasFilters ? "No matching scans" : "No scans yet"}
         </h2>
 
         <p className="mt-2 text-sm leading-6 text-slate-500">
           {hasFilters
             ? "Try changing your search or filters to find another scan."
-            : "Scan a food label to start building your LabelIQ history."}
+            : "Scan a food product to start building your history."}
         </p>
 
         {hasFilters ? (
-          <p className="mt-4 text-xs text-slate-600">
-            Clear the filters above and try again.
-          </p>
+          <button
+            type="button"
+            onClick={onClear}
+            className="mt-6 inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-5 py-3 text-sm font-medium text-slate-300 transition hover:border-white/20 hover:bg-white/[0.07] hover:text-white"
+          >
+            <X size={16} />
+            Clear filters
+          </button>
         ) : (
           <Link
             to="/scan"
@@ -267,8 +238,7 @@ function EmptyState({ hasFilters }) {
 function ScanCard({ scan }) {
   const navigate = useNavigate();
 
-  const status =
-    String(scan.scanStatus || "completed").toLowerCase();
+  const status = String(scan.scanStatus || "completed").toLowerCase();
 
   return (
     <button
@@ -283,17 +253,12 @@ function ScanCard({ scan }) {
     >
       <GlassCard className="p-4 transition duration-300 hover:border-emerald-400/20 hover:bg-white/[0.05] sm:p-5">
         <div className="flex items-start gap-4">
-          {/* Icon */}
           <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-emerald-400/10 bg-emerald-400/[0.06]">
-            <Leaf
-              size={19}
-              className="text-emerald-300"
-            />
+            <Leaf size={19} className="text-emerald-300" />
           </div>
 
-          {/* Main */}
           <div className="min-w-0 flex-1">
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+            <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <h3 className="truncate pr-2 text-sm font-semibold text-white sm:text-base">
                   {scan.productName}
@@ -306,9 +271,7 @@ function ScanCard({ scan }) {
                   </span>
 
                   {formatTime(scan.createdAt) && (
-                    <span>
-                      {formatTime(scan.createdAt)}
-                    </span>
+                    <span>{formatTime(scan.createdAt)}</span>
                   )}
                 </div>
               </div>
@@ -316,7 +279,6 @@ function ScanCard({ scan }) {
               <GradeBadge grade={scan.grade} />
             </div>
 
-            {/* Bottom information */}
             <div className="mt-4 flex flex-wrap items-center gap-3">
               <ScoreBadge score={scan.score} />
 
@@ -338,7 +300,7 @@ function ScanCard({ scan }) {
               )}
 
               {scan.assessment && (
-                <span className="hidden max-w-[280px] truncate text-xs text-slate-600 sm:inline">
+                <span className="hidden max-w-[280px] truncate text-xs text-slate-600 md:inline">
                   {scan.assessment}
                 </span>
               )}
@@ -355,46 +317,180 @@ function ScanCard({ scan }) {
   );
 }
 
+function Pagination({ pagination, onPageChange, disabled }) {
+  const { page, totalPages, total, limit } = pagination;
+
+  if (total === 0) return null;
+
+  const first = (page - 1) * limit + 1;
+  const last = Math.min(page * limit, total);
+
+  return (
+    <div className="mt-6 flex flex-col items-center justify-between gap-3 sm:flex-row">
+      <p className="text-xs text-slate-600">
+        Showing {first}–{last} of {total} scan{total !== 1 ? "s" : ""}
+      </p>
+
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={() => onPageChange(page - 1)}
+          disabled={disabled || !pagination.hasPrev}
+          className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 text-sm font-medium text-slate-300 transition hover:border-white/20 hover:bg-white/[0.07] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <ChevronLeft size={15} />
+          Previous
+        </button>
+
+        <span className="px-2 text-xs text-slate-500">
+          Page {page} of {totalPages}
+        </span>
+
+        <button
+          type="button"
+          onClick={() => onPageChange(page + 1)}
+          disabled={disabled || !pagination.hasNext}
+          className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 text-sm font-medium text-slate-300 transition hover:border-white/20 hover:bg-white/[0.07] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          Next
+          <ChevronRight size={15} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /* =========================================================
    Main
 ========================================================= */
 
 export default function History() {
+  const navigate = useNavigate();
+
   const [scans, setScans] = useState([]);
+  const [pagination, setPagination] = useState({
+    page: 1,
+    limit: PAGE_SIZE,
+    total: 0,
+    totalPages: 1,
+    hasNext: false,
+    hasPrev: false,
+  });
+
   const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
+  const [fetching, setFetching] = useState(false);
   const [error, setError] = useState("");
 
+  // Filter state
+  const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
-  const [gradeFilter, setGradeFilter] = useState("all");
-  const [sortOrder, setSortOrder] = useState("newest");
+  const [grade, setGrade] = useState("all");
+  const [range, setRange] = useState("all");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const [sort, setSort] = useState("newest");
+  const [page, setPage] = useState(1);
   const [showFilters, setShowFilters] = useState(false);
+
+  const [reloadKey, setReloadKey] = useState(0);
+
+  const requestId = useRef(0);
+
+  /* =======================================================
+     Debounce search
+  ======================================================= */
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setSearch(searchInput.trim());
+      setPage(1);
+    }, SEARCH_DEBOUNCE_MS);
+
+    return () => clearTimeout(timer);
+  }, [searchInput]);
+
+  /* =======================================================
+     Custom range validation (client side, mirrors server)
+  ======================================================= */
+
+  const customRangeError =
+    range === "custom"
+      ? !fromDate && !toDate
+        ? "Pick a start date, an end date, or both."
+        : fromDate && toDate && fromDate > toDate
+        ? "The start date cannot be after the end date."
+        : ""
+      : "";
 
   /* =======================================================
      Fetch
   ======================================================= */
 
-  const fetchHistory = async (isRefresh = false) => {
-    try {
-      if (isRefresh) {
-        setRefreshing(true);
-      } else {
-        setLoading(true);
-      }
+  const fetchHistory = useCallback(async () => {
+    if (customRangeError) {
+      return;
+    }
 
+    const currentRequest = ++requestId.current;
+
+    try {
+      setFetching(true);
       setError("");
 
-      const response = await api.get("/scan/history");
+      const params = {
+        page,
+        limit: PAGE_SIZE,
+        sort,
+      };
 
-      const rawScans = extractScanArray(response);
+      if (search) params.search = search;
+      if (grade !== "all") params.grade = grade;
 
-      const normalized = rawScans
-        .map(normalizeScan)
-        .filter(Boolean);
+      if (range !== "all") {
+        params.range = range;
 
-      setScans(normalized);
+        if (range === "custom") {
+          if (fromDate) params.from = fromDate;
+          if (toDate) params.to = toDate;
+        }
+      }
+
+      const response = await api.get("/scan/history", { params });
+
+      // Ignore stale responses
+      if (currentRequest !== requestId.current) {
+        return;
+      }
+
+      const body = response?.data;
+      const rows = Array.isArray(body?.data) ? body.data : [];
+      const meta = body?.pagination;
+
+      // Requested page no longer exists (e.g. after filtering)
+      if (meta && meta.total > 0 && page > meta.totalPages) {
+        setPage(meta.totalPages);
+        return;
+      }
+
+      setScans(rows.map(normalizeScan).filter(Boolean));
+
+      if (meta) {
+        setPagination(meta);
+      }
     } catch (err) {
+      if (currentRequest !== requestId.current) {
+        return;
+      }
+
       console.error("History fetch error:", err);
+
+      if (err?.response?.status === 401) {
+        localStorage.removeItem("token");
+        localStorage.removeItem("user");
+
+        navigate("/login", { replace: true });
+        return;
+      }
 
       setError(
         err?.response?.data?.message ||
@@ -403,100 +499,75 @@ export default function History() {
 
       setScans([]);
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (currentRequest === requestId.current) {
+        setLoading(false);
+        setFetching(false);
+      }
     }
-  };
+  }, [
+    page,
+    sort,
+    search,
+    grade,
+    range,
+    fromDate,
+    toDate,
+    customRangeError,
+    navigate,
+    reloadKey,
+  ]);
 
   useEffect(() => {
     fetchHistory();
-  }, []);
+  }, [fetchHistory]);
 
   /* =======================================================
-     Filter + Sort
+     Handlers
   ======================================================= */
 
-  const filteredScans = useMemo(() => {
-    const query = search.trim().toLowerCase();
+  const changeGrade = (value) => {
+    setGrade(value);
+    setPage(1);
+  };
 
-    const result = scans.filter((scan) => {
-      const matchesSearch =
-        !query ||
-        scan.productName
-          .toLowerCase()
-          .includes(query);
+  const changeSort = (value) => {
+    setSort(value);
+    setPage(1);
+  };
 
-      const matchesGrade =
-        gradeFilter === "all" ||
-        scan.grade === gradeFilter;
+  const changeRange = (value) => {
+    setRange(value);
+    setPage(1);
 
-      return matchesSearch && matchesGrade;
-    });
-
-    result.sort((a, b) => {
-      const first = a.createdAt
-        ? new Date(a.createdAt).getTime()
-        : 0;
-
-      const second = b.createdAt
-        ? new Date(b.createdAt).getTime()
-        : 0;
-
-      return sortOrder === "newest"
-        ? second - first
-        : first - second;
-    });
-
-    return result;
-  }, [
-    scans,
-    search,
-    gradeFilter,
-    sortOrder,
-  ]);
+    if (value !== "custom") {
+      setFromDate("");
+      setToDate("");
+    }
+  };
 
   const hasFilters =
-    Boolean(search.trim()) ||
-    gradeFilter !== "all";
+    Boolean(search) || grade !== "all" || range !== "all";
 
   const clearFilters = () => {
+    setSearchInput("");
     setSearch("");
-    setGradeFilter("all");
+    setGrade("all");
+    setRange("all");
+    setFromDate("");
+    setToDate("");
+    setPage(1);
+  };
+
+  const goToPage = (next) => {
+    if (next < 1 || next > pagination.totalPages) return;
+
+    setPage(next);
+
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   /* =======================================================
-     Summary
-  ======================================================= */
-
-  const summary = useMemo(() => {
-    const graded = scans.filter(
-      (scan) => scan.grade
-    );
-
-    const averageScoreScans = scans.filter(
-      (scan) => scan.score !== null
-    );
-
-    const averageScore =
-      averageScoreScans.length > 0
-        ? averageScoreScans.reduce(
-            (sum, scan) => sum + scan.score,
-            0
-          ) / averageScoreScans.length
-        : null;
-
-    return {
-      total: scans.length,
-      graded: graded.length,
-      averageScore,
-      hiddenSugar: scans.filter(
-        (scan) => scan.hiddenSugarDetected
-      ).length,
-    };
-  }, [scans]);
-
-  /* =======================================================
-     Loading
+     Initial loading
   ======================================================= */
 
   if (loading) {
@@ -504,10 +575,7 @@ export default function History() {
       <div className="min-h-screen bg-[#06100d] text-white">
         <div className="flex min-h-screen items-center justify-center">
           <div className="flex flex-col items-center">
-            <Loader2
-              size={28}
-              className="animate-spin text-emerald-400"
-            />
+            <Loader2 size={28} className="animate-spin text-emerald-400" />
 
             <p className="mt-3 text-sm text-slate-500">
               Loading your scan history...
@@ -543,15 +611,9 @@ export default function History() {
       {/* Header */}
       <header className="sticky top-0 z-30 border-b border-white/8 bg-[#06100d]/85 backdrop-blur-xl">
         <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4 sm:px-6 lg:px-8">
-          <Link
-            to="/dashboard"
-            className="flex items-center gap-3"
-          >
+          <Link to="/dashboard" className="flex items-center gap-3">
             <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-emerald-400/20 bg-emerald-400/10">
-              <Leaf
-                size={18}
-                className="text-emerald-300"
-              />
+              <Leaf size={18} className="text-emerald-300" />
             </div>
 
             <div>
@@ -568,20 +630,16 @@ export default function History() {
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => fetchHistory(true)}
-              disabled={refreshing}
+              onClick={() => setReloadKey((value) => value + 1)}
+              disabled={fetching}
               className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-sm font-medium text-slate-300 transition hover:border-white/20 hover:bg-white/[0.07] hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
             >
               <RefreshCw
                 size={15}
-                className={
-                  refreshing ? "animate-spin" : ""
-                }
+                className={fetching ? "animate-spin" : ""}
               />
 
-              <span className="hidden sm:inline">
-                Refresh
-              </span>
+              <span className="hidden sm:inline">Refresh</span>
             </button>
 
             <Link
@@ -589,9 +647,7 @@ export default function History() {
               className="inline-flex items-center gap-2 rounded-xl bg-emerald-400 px-3.5 py-2 text-sm font-semibold text-[#03110c] transition hover:bg-emerald-300"
             >
               <FileSearch size={15} />
-              <span className="hidden sm:inline">
-                New scan
-              </span>
+              <span className="hidden sm:inline">New scan</span>
             </Link>
           </div>
         </div>
@@ -620,8 +676,7 @@ export default function History() {
               </h1>
 
               <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-400">
-                Review the food labels you've analyzed with
-                LabelIQ.
+                Review the food labels you've analyzed with LabelIQ.
               </p>
             </div>
 
@@ -655,7 +710,7 @@ export default function History() {
 
             <button
               type="button"
-              onClick={() => fetchHistory()}
+              onClick={() => setReloadKey((value) => value + 1)}
               className="text-xs font-semibold text-red-300 hover:text-red-200"
             >
               Retry
@@ -663,97 +718,8 @@ export default function History() {
           </div>
         )}
 
-        {/* Summary */}
-        <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          <GlassCard className="p-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs text-slate-600">
-                  Total scans
-                </p>
-
-                <p className="mt-1 text-xl font-bold text-white">
-                  {summary.total}
-                </p>
-              </div>
-
-              <div className="rounded-xl border border-emerald-400/15 bg-emerald-400/10 p-2.5">
-                <FileSearch
-                  size={17}
-                  className="text-emerald-300"
-                />
-              </div>
-            </div>
-          </GlassCard>
-
-          <GlassCard className="p-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs text-slate-600">
-                  Average score
-                </p>
-
-                <p className="mt-1 text-xl font-bold text-white">
-                  {summary.averageScore !== null
-                    ? summary.averageScore.toFixed(1)
-                    : "—"}
-                </p>
-              </div>
-
-              <div className="rounded-xl border border-cyan-400/15 bg-cyan-400/10 p-2.5">
-                <Sparkles
-                  size={17}
-                  className="text-cyan-300"
-                />
-              </div>
-            </div>
-          </GlassCard>
-
-          <GlassCard className="p-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs text-slate-600">
-                  Graded scans
-                </p>
-
-                <p className="mt-1 text-xl font-bold text-white">
-                  {summary.graded}
-                </p>
-              </div>
-
-              <div className="rounded-xl border border-lime-400/15 bg-lime-400/10 p-2.5">
-                <CheckCircle2
-                  size={17}
-                  className="text-lime-300"
-                />
-              </div>
-            </div>
-          </GlassCard>
-
-          <GlassCard className="p-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs text-slate-600">
-                  Hidden sugar
-                </p>
-
-                <p className="mt-1 text-xl font-bold text-white">
-                  {summary.hiddenSugar}
-                </p>
-              </div>
-
-              <div className="rounded-xl border border-amber-400/15 bg-amber-400/10 p-2.5">
-                <ShieldAlert
-                  size={17}
-                  className="text-amber-300"
-                />
-              </div>
-            </div>
-          </GlassCard>
-        </section>
-
         {/* Search + Filters */}
-        <GlassCard className="mt-6 p-4">
+        <GlassCard className="p-4">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
             <div className="relative flex-1">
               <Search
@@ -763,18 +729,17 @@ export default function History() {
 
               <input
                 type="text"
-                value={search}
-                onChange={(event) =>
-                  setSearch(event.target.value)
-                }
+                value={searchInput}
+                maxLength={100}
+                onChange={(event) => setSearchInput(event.target.value)}
                 placeholder="Search scanned products..."
                 className="h-11 w-full rounded-xl border border-white/10 bg-black/15 pl-10 pr-10 text-sm text-white outline-none transition placeholder:text-slate-700 focus:border-emerald-400/30 focus:bg-black/20"
               />
 
-              {search && (
+              {searchInput && (
                 <button
                   type="button"
-                  onClick={() => setSearch("")}
+                  onClick={() => setSearchInput("")}
                   className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-600 transition hover:text-slate-300"
                 >
                   <X size={15} />
@@ -784,12 +749,10 @@ export default function History() {
 
             <button
               type="button"
-              onClick={() =>
-                setShowFilters((value) => !value)
-              }
+              onClick={() => setShowFilters((value) => !value)}
               className={`inline-flex h-11 items-center justify-center gap-2 rounded-xl border px-4 text-sm font-medium transition ${
                 showFilters || hasFilters
-                  ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
+                  ? chipActive
                   : "border-white/10 bg-white/[0.03] text-slate-400 hover:bg-white/[0.06] hover:text-white"
               }`}
             >
@@ -799,7 +762,7 @@ export default function History() {
           </div>
 
           {showFilters && (
-            <div className="mt-4 grid gap-3 border-t border-white/8 pt-4 sm:grid-cols-2">
+            <div className="mt-4 grid gap-4 border-t border-white/8 pt-4 md:grid-cols-3">
               {/* Grade */}
               <div>
                 <label className="mb-2 block text-xs font-medium text-slate-500">
@@ -807,29 +770,79 @@ export default function History() {
                 </label>
 
                 <div className="flex flex-wrap gap-2">
-                  {["all", "A", "B", "C", "D"].map(
-                    (grade) => (
-                      <button
-                        key={grade}
-                        type="button"
-                        onClick={() =>
-                          setGradeFilter(grade)
-                        }
-                        className={`rounded-lg border px-3 py-2 text-xs font-medium transition ${
-                          gradeFilter === grade
-                            ? grade === "all"
-                              ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
-                              : gradeStyle[grade]
-                            : "border-white/10 bg-white/[0.03] text-slate-500 hover:text-slate-300"
-                        }`}
-                      >
-                        {grade === "all"
-                          ? "All grades"
-                          : `Grade ${grade}`}
-                      </button>
-                    )
-                  )}
+                  {["all", "A", "B", "C", "D"].map((value) => (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => changeGrade(value)}
+                      className={`rounded-lg border px-3 py-2 text-xs font-medium transition ${
+                        grade === value
+                          ? value === "all"
+                            ? chipActive
+                            : gradeStyle[value]
+                          : chipIdle
+                      }`}
+                    >
+                      {value === "all" ? "All grades" : `Grade ${value}`}
+                    </button>
+                  ))}
                 </div>
+              </div>
+
+              {/* Date range */}
+              <div>
+                <label className="mb-2 block text-xs font-medium text-slate-500">
+                  Date range
+                </label>
+
+                <div className="flex flex-wrap gap-2">
+                  {RANGE_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => changeRange(option.value)}
+                      className={`rounded-lg border px-3 py-2 text-xs font-medium transition ${
+                        range === option.value ? chipActive : chipIdle
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+
+                {range === "custom" && (
+                  <div className="mt-3 grid grid-cols-2 gap-2">
+                    <input
+                      type="date"
+                      value={fromDate}
+                      max={toDate || undefined}
+                      onChange={(event) => {
+                        setFromDate(event.target.value);
+                        setPage(1);
+                      }}
+                      aria-label="From date"
+                      className="h-10 rounded-lg border border-white/10 bg-black/15 px-3 text-xs text-white outline-none [color-scheme:dark] focus:border-emerald-400/30"
+                    />
+
+                    <input
+                      type="date"
+                      value={toDate}
+                      min={fromDate || undefined}
+                      onChange={(event) => {
+                        setToDate(event.target.value);
+                        setPage(1);
+                      }}
+                      aria-label="To date"
+                      className="h-10 rounded-lg border border-white/10 bg-black/15 px-3 text-xs text-white outline-none [color-scheme:dark] focus:border-emerald-400/30"
+                    />
+                  </div>
+                )}
+
+                {customRangeError && (
+                  <p className="mt-2 text-xs text-amber-300">
+                    {customRangeError}
+                  </p>
+                )}
               </div>
 
               {/* Sort */}
@@ -839,45 +852,40 @@ export default function History() {
                 </label>
 
                 <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSortOrder("newest")
-                    }
-                    className={`rounded-lg border px-3 py-2 text-xs font-medium transition ${
-                      sortOrder === "newest"
-                        ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
-                        : "border-white/10 bg-white/[0.03] text-slate-500 hover:text-slate-300"
-                    }`}
-                  >
-                    Newest first
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setSortOrder("oldest")
-                    }
-                    className={`rounded-lg border px-3 py-2 text-xs font-medium transition ${
-                      sortOrder === "oldest"
-                        ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
-                        : "border-white/10 bg-white/[0.03] text-slate-500 hover:text-slate-300"
-                    }`}
-                  >
-                    Oldest first
-                  </button>
+                  {SORT_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => changeSort(option.value)}
+                      className={`rounded-lg border px-3 py-2 text-xs font-medium transition ${
+                        sort === option.value ? chipActive : chipIdle
+                      }`}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
                 </div>
               </div>
             </div>
           )}
 
-          {(hasFilters || search) && (
-            <div className="mt-4 flex items-center justify-between border-t border-white/8 pt-3">
-              <p className="text-xs text-slate-600">
-                Showing {filteredScans.length} of{" "}
-                {scans.length} scans
-              </p>
+          <div className="mt-4 flex items-center justify-between border-t border-white/8 pt-3">
+            <p className="text-xs text-slate-600">
+              {fetching ? (
+                <span className="inline-flex items-center gap-1.5">
+                  <Loader2 size={12} className="animate-spin" />
+                  Updating...
+                </span>
+              ) : (
+                <>
+                  {pagination.total} scan
+                  {pagination.total !== 1 ? "s" : ""}
+                  {hasFilters ? " match your filters" : " in total"}
+                </>
+              )}
+            </p>
 
+            {hasFilters && (
               <button
                 type="button"
                 onClick={clearFilters}
@@ -885,24 +893,33 @@ export default function History() {
               >
                 Clear filters
               </button>
-            </div>
-          )}
+            )}
+          </div>
         </GlassCard>
 
         {/* Results */}
         <section className="mt-6">
-          {filteredScans.length === 0 ? (
-            <EmptyState hasFilters={hasFilters} />
+          {scans.length === 0 && !error ? (
+            fetching ? null : (
+              <EmptyState hasFilters={hasFilters} onClear={clearFilters} />
+            )
           ) : (
-            <div className="space-y-3">
-              {filteredScans.map((scan, index) => (
-                <ScanCard
-                  key={`${scan.id}-${index}`}
-                  scan={scan}
-                />
+            <div
+              className={`space-y-3 transition-opacity ${
+                fetching ? "opacity-60" : "opacity-100"
+              }`}
+            >
+              {scans.map((scan, index) => (
+                <ScanCard key={`${scan.id}-${index}`} scan={scan} />
               ))}
             </div>
           )}
+
+          <Pagination
+            pagination={pagination}
+            onPageChange={goToPage}
+            disabled={fetching}
+          />
         </section>
 
         {/* Footer */}

@@ -16,6 +16,7 @@ import ScanPage from "./pages/ScanPage";
 import ScanResult from "./pages/ScanResult";
 import History from "./pages/History";
 import Analytics from "./pages/Analytics";
+import Comparison from "./pages/Comparison";
 import BrandRatings from "./pages/BrandRatings";
 import HealthProfile from "./pages/HealthProfile";
 import Settings from "./pages/Settings";
@@ -38,6 +39,7 @@ function App() {
           <Route path="/scan/:scanId" element={<ScanResult />} />
           <Route path="/history" element={<History />} />
           <Route path="/analytics" element={<Analytics />} />
+          <Route path="/compare" element={<Comparison />} />
           <Route path="/brands" element={<BrandRatings />} />
           <Route path="/profile" element={<HealthProfile />} />
           <Route path="/settings" element={<Settings />} />

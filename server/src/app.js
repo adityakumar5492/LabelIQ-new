@@ -9,6 +9,8 @@ const blocklistRoutes = require("./routes/blocklist.routes");
 const brandRoutes = require("./routes/brand.routes");
 const productRoutes = require("./routes/product.routes");
 const scanRoutes = require("./routes/scan.routes");
+const analyticsRoutes = require("./routes/analytics.routes");
+const comparisonRoutes = require("./routes/comparison.routes");
 
 
 const app = express();
@@ -34,6 +36,8 @@ app.use("/api/blocklist", blocklistRoutes);
 app.use("/api/brands", brandRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api/scan", scanRoutes);
+app.use("/api/analytics", analyticsRoutes);
+app.use("/api/comparison", comparisonRoutes);
 
 
 

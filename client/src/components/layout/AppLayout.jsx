@@ -13,6 +13,7 @@ import {
   Tag,
   UserRound,
   X,
+  GitCompare,
 } from "lucide-react";
 
 import {
@@ -45,6 +46,11 @@ const mainNavigation = [
     label: "Analytics",
     path: "/analytics",
     icon: BarChart3,
+  },
+  {
+    label: "Compare",
+    path: "/compare",
+    icon: GitCompare,
   },
   {
     label: "Brand Ratings",

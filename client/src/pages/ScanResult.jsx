@@ -8,15 +8,18 @@ import {
 import {
   AlertTriangle,
   ArrowLeft,
+  BookOpen,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   CircleAlert,
   Clock3,
   Droplets,
-  ExternalLink,
+  Flag,
   Flame,
+  Info,
   Leaf,
+  Package,
   ShieldAlert,
   Sparkles,
   Utensils,
@@ -29,36 +32,48 @@ import api from "../api/axios";
    Helpers
 ========================================================= */
 
-const normalizeData = (locationState, fetchedData = null) => {
-  const data =
-    locationState?.scanData || fetchedData;
+const isPlainObject = (value) =>
+  value !== null &&
+  typeof value === "object" &&
+  !Array.isArray(value);
 
-  if (!data) return null;
+const asArray = (value) =>
+  Array.isArray(value) ? value : [];
 
-  return {
-    filename: data.filename || "Food label",
-    ocr: data.ocr || {},
-    aiAnalysis: data.ai_analysis || {},
-    rag: data.rag || {},
-    analysis: data.analysis || {},
-    database: data.database || {},
-  };
+/*
+ * Returns a finite number, or null.
+ * null / undefined / "" / NaN all become null so that a
+ * missing value is never shown as 0.
+ * (A real 0 stays 0.)
+ */
+const toNumber = (value) => {
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
+    return null;
+  }
+
+  const number = Number(value);
+
+  return Number.isFinite(number) ? number : null;
 };
 
+/* 13.90 -> "13.9", 140.00 -> "140", null -> null */
+const formatNumber = (value) => {
+  const number = toNumber(value);
+
+  if (number === null) return null;
+
+  return String(Number(number.toFixed(2)));
+};
+
+/* Display only. The score itself is calculated by the backend. */
 const formatScore = (score) => {
-  if (
-    score === null ||
-    score === undefined ||
-    score === ""
-  ) {
-    return "--";
-  }
+  const number = toNumber(score);
 
-  const number = Number(score);
-
-  if (Number.isNaN(number)) {
-    return "--";
-  }
+  if (number === null) return "--";
 
   return Number.isInteger(number)
     ? number
@@ -78,6 +93,163 @@ const formatValue = (
   }
 
   return value;
+};
+
+/* Same key the backend uses to match evidence to ingredients. */
+const nameKey = (name) =>
+  String(name || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+
+/*
+ * The page only trusts the shape it understands.
+ * Anything else becomes an empty object / array so a
+ * malformed response never crashes the page.
+ *
+ * NOTE: ai_insights is a TOP-LEVEL field of the scan response
+ * (next to ai_analysis), for both a fresh scan and a saved scan.
+ */
+const normalizeData = (
+  locationState,
+  fetchedData = null
+) => {
+  const data =
+    locationState?.scanData || fetchedData;
+
+  if (!isPlainObject(data)) return null;
+
+  return {
+    filename:
+      typeof data.filename === "string" &&
+      data.filename
+        ? data.filename
+        : "Food label",
+    ocr: isPlainObject(data.ocr)
+      ? data.ocr
+      : {},
+    aiAnalysis: isPlainObject(
+      data.ai_analysis
+    )
+      ? data.ai_analysis
+      : {},
+    aiInsights: isPlainObject(
+      data.ai_insights
+    )
+      ? data.ai_insights
+      : {},
+    analysis: isPlainObject(data.analysis)
+      ? data.analysis
+      : {},
+    database: isPlainObject(data.database)
+      ? data.database
+      : {},
+  };
+};
+
+/*
+ * Ingredient details come from the backend
+ * (ai_analysis.ingredient_details). "flagged" is the
+ * backend's decision, taken from stored rule matches.
+ * Nothing is matched or calculated here.
+ *
+ * If an older response only has plain ingredient names,
+ * they are shown as normal ingredients (flag state
+ * unknown, never guessed).
+ */
+const normalizeIngredientDetails = (
+  details,
+  names
+) => {
+  const list = asArray(details)
+    .filter(isPlainObject)
+    .filter(
+      (item) =>
+        typeof item.name === "string" &&
+        item.name.trim()
+    )
+    .map((item, index) => ({
+      id: item.id ?? `ing-${index}`,
+      name: item.name,
+      order: toNumber(item.order) ?? index + 1,
+      flagged: item.flagged === true,
+      highestSeverity:
+        typeof item.highest_severity ===
+        "string"
+          ? item.highest_severity
+          : null,
+      flags: asArray(item.flags).filter(
+        isPlainObject
+      ),
+      evidence: asArray(
+        item.evidence
+      ).filter(isPlainObject),
+    }));
+
+  if (list.length > 0) return list;
+
+  return asArray(names)
+    .filter(
+      (name) =>
+        typeof name === "string" &&
+        name.trim()
+    )
+    .map((name, index) => ({
+      id: `name-${index}`,
+      name,
+      order: index + 1,
+      flagged: false,
+      highestSeverity: null,
+      flags: [],
+      evidence: [],
+    }));
+};
+
+/*
+ * Groq explanation, as stored by the backend in ai_insights:
+ * { summary, key_findings, ingredient_explanations }.
+ * Only cleaned for display. Nothing is generated here.
+ */
+const normalizeInsights = (insights) => {
+  const source = isPlainObject(insights)
+    ? insights
+    : {};
+
+  const summary =
+    typeof source.summary === "string" &&
+    source.summary.trim()
+      ? source.summary.trim()
+      : null;
+
+  const keyFindings = asArray(
+    source.key_findings
+  ).filter(
+    (item) =>
+      typeof item === "string" &&
+      item.trim()
+  );
+
+  const ingredientExplanations = asArray(
+    source.ingredient_explanations
+  )
+    .filter(isPlainObject)
+    .filter(
+      (item) =>
+        typeof item.ingredient === "string" &&
+        item.ingredient.trim() &&
+        typeof item.explanation === "string" &&
+        item.explanation.trim()
+    );
+
+  return {
+    summary,
+    keyFindings,
+    ingredientExplanations,
+    hasAny:
+      Boolean(summary) ||
+      keyFindings.length > 0 ||
+      ingredientExplanations.length > 0,
+  };
 };
 
 const severityConfig = {
@@ -103,6 +275,17 @@ const severityConfig = {
   },
 };
 
+const chipSeverityClass = {
+  high: "border-red-400/25 bg-red-400/[0.07] text-red-200",
+  medium:
+    "border-amber-400/20 bg-amber-400/[0.07] text-amber-200",
+  low: "border-cyan-400/20 bg-cyan-400/[0.07] text-cyan-200",
+};
+
+/*
+ * Display styling for the grade the BACKEND returned.
+ * No score thresholds live here.
+ */
 const gradeConfig = {
   A: {
     label: "Excellent",
@@ -128,6 +311,42 @@ const gradeConfig = {
       "border-red-400/30 bg-red-400/10 text-red-300",
   },
 };
+
+const gradeUnavailable = {
+  label: "Grade unavailable",
+  className:
+    "border-white/10 bg-white/[0.04] text-slate-400",
+};
+
+/* Display labels for values the backend sends as codes */
+
+const BASIS_LABELS = {
+  "per-serving": "Per serving",
+  "per-100g": "Per 100 g",
+  "per-100ml": "Per 100 ml",
+  "per-piece": "Per piece",
+};
+
+const FLAG_TYPE_LABELS = {
+  hidden_sugar: "Hidden sugar",
+  ingredient: "Ingredient rule",
+  blocklist: "Personal blocklist",
+  dietary: "Dietary mode",
+  nutrition_limit: "Nutrition limit",
+};
+
+const FLAG_SOURCE_LABELS = {
+  general: "General LabelIQ rule",
+  blocklist: "Your personal blocklist",
+  dietary: "Your dietary mode",
+  nutrition_limit: "Your nutrition limits",
+};
+
+const basisLabel = (basis) =>
+  BASIS_LABELS[basis] || "As extracted";
+
+const flagTypeLabel = (type) =>
+  FLAG_TYPE_LABELS[type] || "Rule match";
 
 /* =========================================================
    Small Components
@@ -172,16 +391,17 @@ function GlassCard({
   );
 }
 
-function SeverityBadge({
-  severity,
-}) {
-  const normalized = String(
-    severity || "medium"
-  ).toLowerCase();
-
+/*
+ * Renders nothing when the severity is missing or unknown,
+ * so the page never invents a severity.
+ */
+function SeverityBadge({ severity }) {
   const config =
-    severityConfig[normalized] ||
-    severityConfig.medium;
+    severityConfig[
+      String(severity || "").toLowerCase()
+    ];
+
+  if (!config) return null;
 
   const Icon = config.icon;
 
@@ -195,11 +415,62 @@ function SeverityBadge({
   );
 }
 
-function EmptyState({ message }) {
+/*
+ * Small label that tells the reader WHERE a piece of
+ * information comes from, so rule decisions, evidence and
+ * AI text are never mixed up.
+ *   rule     = deterministic rule engine (the decision)
+ *   evidence = RAG knowledge base (supporting context)
+ *   ai       = Groq (natural-language explanation)
+ */
+const SOURCE_TAGS = {
+  rule: {
+    label: "Rule decision",
+    className:
+      "border-emerald-400/25 bg-emerald-400/10 text-emerald-300",
+  },
+  evidence: {
+    label: "Evidence",
+    className:
+      "border-cyan-400/25 bg-cyan-400/10 text-cyan-300",
+  },
+  ai: {
+    label: "AI explanation",
+    className:
+      "border-violet-400/25 bg-violet-400/10 text-violet-300",
+  },
+};
+
+function SourceTag({ kind }) {
+  const tag = SOURCE_TAGS[kind];
+
+  if (!tag) return null;
+
+  return (
+    <span
+      className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${tag.className}`}
+    >
+      {tag.label}
+    </span>
+  );
+}
+
+/* tone "ok" = good news, tone "info" = nothing to show */
+function EmptyState({
+  message,
+  tone = "ok",
+}) {
+  const Icon =
+    tone === "ok" ? CheckCircle2 : Info;
+
   return (
     <div className="rounded-xl border border-dashed border-white/10 bg-black/10 px-5 py-8 text-center">
-      <CheckCircle2
-        className="mx-auto mb-2 text-emerald-400"
+      <Icon
+        className={`mx-auto mb-2 ${
+          tone === "ok"
+            ? "text-emerald-400"
+            : "text-slate-500"
+        }`}
         size={24}
       />
 
@@ -210,111 +481,228 @@ function EmptyState({ message }) {
   );
 }
 
+function Notice({ children }) {
+  return (
+    <div className="mb-4 flex gap-3 rounded-xl border border-amber-400/20 bg-amber-400/[0.06] p-3.5">
+      <AlertTriangle
+        size={16}
+        className="mt-0.5 shrink-0 text-amber-300"
+      />
+
+      <p className="text-xs leading-5 text-amber-200/80">
+        {children}
+      </p>
+    </div>
+  );
+}
+
+/* =========================================================
+   Product information (read only)
+========================================================= */
+
+function ProductInfoCard({ aiAnalysis }) {
+  const packSize = isPlainObject(
+    aiAnalysis.pack_size
+  )
+    ? aiAnalysis.pack_size.display ||
+      aiAnalysis.pack_size.raw ||
+      null
+    : null;
+
+  const servings = formatNumber(
+    aiAnalysis.servings_per_container
+  );
+
+  const rows = [
+    ["Product", aiAnalysis.product_name],
+    ["Brand", aiAnalysis.brand],
+    ["Variant", aiAnalysis.variant],
+    ["Pack size", packSize],
+    ["Servings per pack", servings],
+  ];
+
+  return (
+    <GlassCard className="p-5 sm:p-6">
+      <div className="mb-4 flex items-center gap-2">
+        <Package
+          size={16}
+          className="text-emerald-300"
+        />
+
+        <h3 className="font-semibold text-white">
+          Product
+        </h3>
+      </div>
+
+      <div className="space-y-3">
+        {rows.map(([label, value]) => (
+          <div
+            key={label}
+            className="flex items-start justify-between gap-4"
+          >
+            <span className="text-xs text-slate-500">
+              {label}
+            </span>
+
+            <span
+              className={`text-right text-xs font-medium ${
+                value
+                  ? "text-slate-300"
+                  : "text-slate-600"
+              }`}
+            >
+              {value || "Not available"}
+            </span>
+          </div>
+        ))}
+      </div>
+    </GlassCard>
+  );
+}
+
 /* =========================================================
    Nutrition
 ========================================================= */
 
+/*
+ * Rows shown in the nutrition card.
+ * "issueKey" points at the rule-engine breakdown group
+ * that already decided whether a limit was exceeded.
+ * The page never compares values with thresholds itself.
+ */
+const NUTRITION_ROWS = [
+  {
+    key: "calories",
+    label: "Calories",
+    unit: "kcal",
+    icon: Flame,
+    issueKey: "calorieIssues",
+  },
+  {
+    key: "protein_g",
+    label: "Protein",
+    unit: "g",
+    icon: Zap,
+  },
+  {
+    key: "carbohydrates_g",
+    label: "Carbohydrates",
+    unit: "g",
+    icon: Utensils,
+  },
+  {
+    key: "total_fat_g",
+    label: "Total Fat",
+    unit: "g",
+    icon: Droplets,
+  },
+  {
+    key: "saturated_fat_g",
+    label: "Saturated Fat",
+    unit: "g",
+    icon: Droplets,
+  },
+  {
+    key: "dietary_fiber_g",
+    label: "Fiber",
+    unit: "g",
+    icon: Leaf,
+  },
+  {
+    key: "total_sugars_g",
+    label: "Total Sugars",
+    unit: "g",
+    icon: Sparkles,
+    issueKey: "sugarIssues",
+  },
+  {
+    key: "added_sugars_g",
+    label: "Added Sugars",
+    unit: "g",
+    icon: Sparkles,
+  },
+  {
+    key: "sodium_mg",
+    label: "Sodium",
+    unit: "mg",
+    icon: Droplets,
+    issueKey: "sodiumIssues",
+  },
+];
+
 function NutritionCard({
   nutrition,
+  meta,
+  converted,
+  breakdown,
 }) {
-  const values = [
-    {
-      label: "Calories",
-      value:
-        nutrition.calories !== null &&
-        nutrition.calories !== undefined
-          ? `${nutrition.calories} kcal`
-          : "—",
-      icon: Flame,
-    },
+  const declaredBasis = meta?.basis || null;
 
-    {
-      label: "Protein",
-      value:
-        nutrition.protein_g !== null &&
-        nutrition.protein_g !== undefined
-          ? `${nutrition.protein_g} g`
-          : "—",
-      icon: Zap,
-    },
+  const convertedValues =
+    isPlainObject(converted) &&
+    isPlainObject(converted.values) &&
+    converted.basis
+      ? converted
+      : null;
 
-    {
-      label: "Carbohydrates",
-      value:
-        nutrition.carbohydrates_g !== null &&
-        nutrition.carbohydrates_g !== undefined
-          ? `${nutrition.carbohydrates_g} g`
-          : "—",
-      icon: Utensils,
-    },
+  /*
+   * Tabs: the label's declared basis is always available.
+   * The other basis only exists when the backend could
+   * calculate it from an explicit serving size.
+   */
+  const tabs = useMemo(() => {
+    const list = [
+      {
+        id: "declared",
+        basis: declaredBasis,
+        calculated: false,
+      },
+    ];
 
-    {
-      label: "Total Fat",
-      value:
-        nutrition.total_fat_g !== null &&
-        nutrition.total_fat_g !== undefined
-          ? `${nutrition.total_fat_g} g`
-          : "—",
-      icon: Droplets,
-    },
+    if (convertedValues) {
+      list.push({
+        id: "converted",
+        basis: convertedValues.basis,
+        calculated: true,
+      });
+    }
 
-    {
-      label: "Saturated Fat",
-      value:
-        nutrition.saturated_fat_g !== null &&
-        nutrition.saturated_fat_g !== undefined
-          ? `${nutrition.saturated_fat_g} g`
-          : "—",
-      icon: Droplets,
-    },
+    // Per serving first, then per 100 g / ml.
+    return list.sort((a, b) => {
+      const rank = (tab) =>
+        tab.basis === "per-serving" ? 0 : 1;
 
-    {
-      label: "Fiber",
-      value:
-        nutrition.dietary_fiber_g !== null &&
-        nutrition.dietary_fiber_g !== undefined
-          ? `${nutrition.dietary_fiber_g} g`
-          : "—",
-      icon: Leaf,
-    },
+      return rank(a) - rank(b);
+    });
+  }, [declaredBasis, convertedValues]);
 
-    {
-      label: "Total Sugars",
-      value:
-        nutrition.total_sugars_g !== null &&
-        nutrition.total_sugars_g !== undefined
-          ? `${nutrition.total_sugars_g} g`
-          : "—",
-      icon: Sparkles,
+  const [activeId, setActiveId] =
+    useState("declared");
 
-      danger:
-        Number(nutrition.total_sugars_g) >
-        Number(
-          nutrition.__sugarThreshold ??
-            Number.POSITIVE_INFINITY
-        ),
-    },
+  const active =
+    tabs.find((tab) => tab.id === activeId) ||
+    tabs.find((tab) => tab.id === "declared");
 
-    {
-      label: "Added Sugars",
-      value:
-        nutrition.added_sugars_g !== null &&
-        nutrition.added_sugars_g !== undefined
-          ? `${nutrition.added_sugars_g} g`
-          : "Not declared",
-      icon: Sparkles,
-    },
+  const showingConverted =
+    active.id === "converted";
 
-    {
-      label: "Sodium",
-      value:
-        nutrition.sodium_mg !== null &&
-        nutrition.sodium_mg !== undefined
-          ? `${nutrition.sodium_mg} mg`
-          : "—",
-      icon: Droplets,
-    },
-  ];
+  const source = showingConverted
+    ? convertedValues.values
+    : nutrition;
+
+  const hasAnyValue = NUTRITION_ROWS.some(
+    (row) => toNumber(nutrition[row.key]) !== null
+  );
+
+  const servingSize =
+    typeof nutrition.serving_size === "string" &&
+    nutrition.serving_size.trim()
+      ? nutrition.serving_size
+      : null;
+
+  const usedAi =
+    meta?.source === "ai" ||
+    meta?.source === "table+ai";
 
   return (
     <GlassCard className="p-5 sm:p-6">
@@ -322,57 +710,177 @@ function NutritionCard({
         icon={Utensils}
         eyebrow="Nutrition"
         title="Nutrition facts"
-        description={`Values are based on ${
-          nutrition.serving_size ||
-          "the analyzed serving"
-        }.`}
+        description={`Serving size: ${
+          servingSize || "Not available"
+        }`}
       />
 
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-        {values.map((item) => {
-          const Icon = item.icon;
+      {!hasAnyValue ? (
+        <EmptyState
+          tone="info"
+          message="No nutrition values could be read from this label."
+        />
+      ) : (
+        <>
+          {/* Basis tabs */}
+          <div className="mb-4 flex flex-wrap items-center gap-2">
+            {tabs.map((tab) => {
+              const selected =
+                tab.id === active.id;
 
-          return (
-            <div
-              key={item.label}
-              className={`rounded-xl border p-4 ${
-                item.danger
-                  ? "border-red-400/20 bg-red-400/[0.06]"
-                  : "border-white/8 bg-black/10"
-              }`}
-            >
-              <div className="mb-2 flex items-center gap-2 text-slate-500">
-                <Icon size={14} />
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  disabled={tabs.length === 1}
+                  onClick={() =>
+                    setActiveId(tab.id)
+                  }
+                  className={`rounded-full border px-3.5 py-1.5 text-xs font-semibold transition ${
+                    selected
+                      ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-300"
+                      : "border-white/10 bg-white/[0.04] text-slate-400 hover:border-white/20 hover:text-white"
+                  } ${
+                    tabs.length === 1
+                      ? "cursor-default"
+                      : ""
+                  }`}
+                >
+                  {tab.basis
+                    ? basisLabel(tab.basis)
+                    : "Basis unavailable"}
 
-                <span className="text-xs">
-                  {item.label}
-                </span>
-              </div>
+                  {tab.calculated && (
+                    <span className="ml-1.5 text-[10px] font-medium uppercase tracking-wide opacity-70">
+                      calculated
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
 
-              <div
-                className={`text-base font-semibold ${
-                  item.danger
-                    ? "text-red-300"
-                    : "text-white"
-                }`}
-              >
-                {item.value}
-              </div>
-            </div>
-          );
-        })}
-      </div>
+          {/* Basis explanation */}
+          <p className="mb-4 text-xs leading-5 text-slate-500">
+            {showingConverted
+              ? `Calculated from the label values using the serving size (${
+                  convertedValues.serving_size
+                }). These numbers are not printed on the label.`
+              : declaredBasis
+              ? `Values as printed on the label (${basisLabel(
+                  declaredBasis
+                ).toLowerCase()}).`
+              : "The nutrition basis could not be determined from the label."}
+          </p>
+
+          {!declaredBasis && (
+            <Notice>
+              It is unclear whether these values
+              are per serving or per 100 g. Check
+              the original packaging before
+              relying on them.
+            </Notice>
+          )}
+
+          {usedAi && !showingConverted && (
+            <Notice>
+              Some values were read with AI
+              assistance because the nutrition
+              table could not be fully read.
+              Please verify them against the pack.
+            </Notice>
+          )}
+
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            {NUTRITION_ROWS.map((row) => {
+              const Icon = row.icon;
+
+              const formatted = formatNumber(
+                source[row.key]
+              );
+
+              /*
+               * The rule engine compared the stored
+               * (declared basis) values, so the limit
+               * highlight is only shown for that view.
+               */
+              const danger =
+                !showingConverted &&
+                row.issueKey &&
+                asArray(
+                  breakdown?.[row.issueKey]
+                ).length > 0;
+
+              const derivedFromSalt =
+                row.key === "sodium_mg" &&
+                formatted !== null &&
+                meta?.sodium_source === "salt";
+
+              return (
+                <div
+                  key={row.key}
+                  className={`rounded-xl border p-4 ${
+                    danger
+                      ? "border-red-400/20 bg-red-400/[0.06]"
+                      : "border-white/8 bg-black/10"
+                  }`}
+                >
+                  <div className="mb-2 flex items-center gap-2 text-slate-500">
+                    <Icon size={14} />
+
+                    <span className="text-xs">
+                      {row.label}
+                    </span>
+                  </div>
+
+                  {formatted !== null ? (
+                    <div
+                      className={`text-base font-semibold ${
+                        danger
+                          ? "text-red-300"
+                          : "text-white"
+                      }`}
+                    >
+                      {formatted} {row.unit}
+                    </div>
+                  ) : (
+                    <div className="text-sm text-slate-600">
+                      Not available
+                    </div>
+                  )}
+
+                  {danger && (
+                    <p className="mt-1.5 text-[11px] text-red-300/70">
+                      Exceeds your limit
+                    </p>
+                  )}
+
+                  {derivedFromSalt && (
+                    <p className="mt-1.5 text-[11px] leading-4 text-slate-500">
+                      {!showingConverted &&
+                      toNumber(meta.salt_g) !==
+                        null
+                        ? `Derived from salt: ${formatNumber(
+                            meta.salt_g
+                          )} g × 400`
+                        : "Derived from the salt value on the label"}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
     </GlassCard>
   );
 }
 
 /* =========================================================
-   Rule Match
+   Rule Match (rule engine overview)
 ========================================================= */
 
-function RuleMatch({
-  match,
-}) {
+function RuleMatch({ match }) {
   return (
     <div className="rounded-xl border border-white/8 bg-black/10 p-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -390,11 +898,19 @@ function RuleMatch({
             />
           </div>
 
-          {match.matched_value && (
-            <div className="mt-2 inline-flex rounded-md border border-white/8 bg-white/[0.025] px-2.5 py-1 text-xs text-slate-400">
-              {match.matched_value}
-            </div>
-          )}
+          <div className="mt-2 flex flex-wrap gap-2">
+            {match.rule_code && (
+              <span className="inline-flex rounded-md border border-white/8 bg-white/[0.025] px-2.5 py-1 font-mono text-[11px] text-slate-500">
+                {match.rule_code}
+              </span>
+            )}
+
+            {match.matched_value && (
+              <span className="inline-flex rounded-md border border-white/8 bg-white/[0.025] px-2.5 py-1 text-xs text-slate-400">
+                Matched: {match.matched_value}
+              </span>
+            )}
+          </div>
         </div>
       </div>
 
@@ -417,10 +933,7 @@ function IssueSection({
   items,
   icon: Icon,
 }) {
-  if (
-    !items ||
-    items.length === 0
-  ) {
+  if (!items || items.length === 0) {
     return null;
   }
 
@@ -445,19 +958,121 @@ function IssueSection({
       </div>
 
       <div className="space-y-2.5">
-        {items.map(
-          (match, index) => (
-            <RuleMatch
-              key={
-                match.id ||
-                `${match.rule_code}-${match.matched_value}-${index}`
-              }
-              match={match}
-            />
-          )
-        )}
+        {items.map((match, index) => (
+          <RuleMatch
+            key={
+              match.id ||
+              `${match.rule_code}-${match.matched_value}-${index}`
+            }
+            match={match}
+          />
+        ))}
       </div>
     </div>
+  );
+}
+
+/* =========================================================
+   Personalized warnings
+   Built only from the rule engine's personal rule groups
+   (blocklist, calorie / sugar / sodium limits, dietary mode).
+   Nothing is evaluated here.
+========================================================= */
+
+function PersonalizedWarningsCard({
+  groups,
+  personalization,
+}) {
+  const profileApplied = Boolean(
+    personalization?.profileApplied
+  );
+
+  const warnings = groups.flatMap((group) =>
+    group.items.map((match) => ({
+      ...match,
+      groupTitle: group.title,
+    }))
+  );
+
+  return (
+    <GlassCard className="p-5 sm:p-6">
+      <SectionHeader
+        icon={ShieldAlert}
+        eyebrow="Personalized warnings"
+        title={
+          warnings.length > 0
+            ? `${warnings.length} ${
+                warnings.length === 1
+                  ? "warning"
+                  : "warnings"
+              } for your profile`
+            : "No personalized warnings"
+        }
+        description="Warnings come from LabelIQ's deterministic rules applied to your blocklist, nutrition limits and dietary mode."
+      />
+
+      {warnings.length === 0 ? (
+        <EmptyState
+          message={
+            profileApplied
+              ? "This product did not conflict with your configured profile."
+              : "No personal health profile was applied, so no personalized warnings were generated."
+          }
+        />
+      ) : (
+        <div className="space-y-3">
+          {warnings.map((warning, index) => (
+            <div
+              key={
+                warning.id ||
+                `${warning.rule_code}-${warning.matched_value}-${index}`
+              }
+              className="rounded-xl border border-white/8 bg-black/10 p-4"
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <SourceTag kind="rule" />
+
+                <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-0.5 text-[11px] font-semibold text-slate-200">
+                  {warning.groupTitle}
+                </span>
+
+                <SeverityBadge
+                  severity={warning.severity}
+                />
+              </div>
+
+              <h4 className="mt-3 font-medium text-white">
+                {formatValue(
+                  warning.rule_name,
+                  "Rule match"
+                )}
+              </h4>
+
+              {warning.matched_value && (
+                <p className="mt-1 text-xs text-slate-400">
+                  Detected:{" "}
+                  <span className="text-slate-300">
+                    {warning.matched_value}
+                  </span>
+                </p>
+              )}
+
+              {warning.explanation && (
+                <p className="mt-2 text-sm leading-6 text-slate-400">
+                  {warning.explanation}
+                </p>
+              )}
+
+              {warning.rule_code && (
+                <p className="mt-2 font-mono text-[11px] text-slate-600">
+                  {warning.rule_code}
+                </p>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </GlassCard>
   );
 }
 
@@ -465,73 +1080,408 @@ function IssueSection({
    Ingredients
 ========================================================= */
 
-function IngredientsCard({
-  ingredients,
-  ruleMatches,
-}) {
-  const flaggedIngredients =
-    useMemo(() => {
-      const values = new Set();
-
-      ruleMatches.forEach(
-        (match) => {
-          if (match.matched_value) {
-            values.add(
-              String(
-                match.matched_value
-              ).toLowerCase()
-            );
-          }
-        }
-      );
-
-      return values;
-    }, [ruleMatches]);
+function IngredientsCard({ ingredients }) {
+  const flaggedCount = ingredients.filter(
+    (ingredient) => ingredient.flagged
+  ).length;
 
   return (
     <GlassCard className="p-5 sm:p-6">
       <SectionHeader
         icon={Leaf}
         eyebrow="Ingredients"
-        title="Ingredient breakdown"
-        description="Ingredients extracted from the product label and evaluated against your configured profile."
+        title="Ingredient list"
+        description="Ingredients in the order printed on the label. Flagged ingredients matched a LabelIQ rule."
       />
 
       {ingredients.length === 0 ? (
-        <EmptyState message="No ingredients were saved for this scan." />
+        <EmptyState
+          tone="info"
+          message="No ingredients were found for this scan."
+        />
       ) : (
-        <div className="flex flex-wrap gap-2">
-          {ingredients.map(
-            (ingredient, index) => {
-              const isFlagged =
-                flaggedIngredients.has(
-                  String(
-                    ingredient
-                  ).toLowerCase()
-                );
+        <>
+          <p className="mb-4 text-xs text-slate-500">
+            {ingredients.length}{" "}
+            {ingredients.length === 1
+              ? "ingredient"
+              : "ingredients"}
+            {" · "}
+            {flaggedCount} flagged
+          </p>
+
+          <div className="flex flex-wrap gap-2">
+            {ingredients.map((ingredient) => {
+              const firstFlag =
+                ingredient.flags[0];
+
+              const chipClass =
+                ingredient.flagged
+                  ? chipSeverityClass[
+                      ingredient
+                        .highestSeverity
+                    ] ||
+                    chipSeverityClass.medium
+                  : "border-white/8 bg-black/10 text-slate-300";
 
               return (
                 <span
-                  key={`${ingredient}-${index}`}
-                  className={`rounded-lg border px-3 py-2 text-xs sm:text-sm ${
-                    isFlagged
-                      ? "border-amber-400/20 bg-amber-400/[0.07] text-amber-200"
-                      : "border-white/8 bg-black/10 text-slate-300"
-                  }`}
+                  key={ingredient.id}
+                  className={`rounded-lg border px-3 py-2 text-xs sm:text-sm ${chipClass}`}
                 >
-                  {ingredient}
+                  <span className="mr-1.5 text-slate-500">
+                    {ingredient.order}.
+                  </span>
 
-                  {isFlagged && (
-                    <span className="ml-2 text-[10px] font-semibold uppercase tracking-wide text-amber-400">
-                      flagged
+                  {ingredient.name}
+
+                  {ingredient.flagged && (
+                    <span className="ml-2 text-[10px] font-semibold uppercase tracking-wide opacity-80">
+                      {firstFlag
+                        ? flagTypeLabel(
+                            firstFlag.flag_type
+                          )
+                        : "Flagged"}
+                      {ingredient.flags.length >
+                        1 &&
+                        ` +${
+                          ingredient.flags
+                            .length - 1
+                        }`}
                     </span>
                   )}
                 </span>
               );
-            }
+            })}
+          </div>
+        </>
+      )}
+    </GlassCard>
+  );
+}
+
+/* =========================================================
+   RAG evidence (supporting context only)
+========================================================= */
+
+function EvidenceList({ evidence }) {
+  if (evidence.length === 0) {
+    return (
+      <p className="text-xs leading-5 text-slate-600">
+        No supporting evidence is available in
+        the LabelIQ knowledge base for this
+        ingredient.
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-2.5">
+      {evidence.map((item, index) => (
+        <div
+          key={`${item.name}-${index}`}
+          className="rounded-lg border border-white/8 bg-white/[0.025] p-3"
+        >
+          {item.name && (
+            <p className="text-xs font-medium capitalize text-slate-300">
+              {item.name}
+            </p>
+          )}
+
+          {item.description && (
+            <p className="mt-1.5 text-xs leading-5 text-slate-400">
+              {item.description}
+            </p>
+          )}
+
+          {item.purpose && (
+            <p className="mt-1.5 text-xs leading-5 text-slate-500">
+              <span className="text-slate-400">
+                Purpose:
+              </span>{" "}
+              {item.purpose}
+            </p>
+          )}
+
+          {item.source && (
+            <p className="mt-1.5 text-[11px] text-cyan-300/80">
+              Source: {item.source}
+            </p>
           )}
         </div>
+      ))}
+    </div>
+  );
+}
+
+/* =========================================================
+   Flagged ingredients
+   Ingredient -> Rule decision -> Evidence -> AI explanation
+   Each source is shown in its own labelled block.
+========================================================= */
+
+function FlagReason({ flag }) {
+  const details = [
+    ["Rule", flag.rule_name],
+    ["Rule code", flag.rule_code],
+    ["Matched value", flag.matched_value],
+    ["Configured pattern", flag.rule_pattern],
+    [
+      "Rule source",
+      FLAG_SOURCE_LABELS[flag.category] ||
+        null,
+    ],
+  ].filter(([, value]) => value);
+
+  return (
+    <div className="rounded-xl border border-white/8 bg-black/10 p-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-[11px] font-semibold text-slate-200">
+          {flagTypeLabel(flag.flag_type)}
+        </span>
+
+        <SeverityBadge
+          severity={flag.severity}
+        />
+      </div>
+
+      <p className="mt-3 text-sm leading-6 text-slate-300">
+        {flag.explanation ||
+          "No explanation was stored for this rule match."}
+      </p>
+
+      <dl className="mt-3 grid gap-x-4 gap-y-1.5 text-xs sm:grid-cols-[auto_1fr]">
+        {details.map(([label, value]) => (
+          <React.Fragment key={label}>
+            <dt className="text-slate-500">
+              {label}
+            </dt>
+
+            <dd className="break-words text-slate-300">
+              {value}
+            </dd>
+          </React.Fragment>
+        ))}
+      </dl>
+    </div>
+  );
+}
+
+function FlaggedIngredient({
+  ingredient,
+  aiExplanation,
+  aiAvailable,
+}) {
+  const [showEvidence, setShowEvidence] =
+    useState(false);
+
+  return (
+    <div className="rounded-2xl border border-white/10 bg-white/[0.025] p-4 sm:p-5">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-base font-semibold text-white">
+          <span className="mr-2 text-sm font-normal text-slate-500">
+            {ingredient.order}.
+          </span>
+
+          {ingredient.name}
+        </h3>
+
+        <SeverityBadge
+          severity={ingredient.highestSeverity}
+        />
+      </div>
+
+      {/* 1. Rule decision */}
+      <div className="mb-3 mt-4 flex items-center gap-2">
+        <SourceTag kind="rule" />
+
+        <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+          Why was this flagged?
+        </span>
+      </div>
+
+      <div className="space-y-2.5">
+        {ingredient.flags.map(
+          (flag, index) => (
+            <FlagReason
+              key={flag.id || `${flag.rule_code}-${index}`}
+              flag={flag}
+            />
+          )
+        )}
+      </div>
+
+      {/* 2. Evidence (does not decide anything) */}
+      <div className="mt-5">
+        <button
+          type="button"
+          onClick={() =>
+            setShowEvidence((value) => !value)
+          }
+          className="inline-flex items-center gap-2 text-xs font-medium text-cyan-300 transition hover:text-cyan-200"
+        >
+          <BookOpen size={14} />
+
+          {showEvidence
+            ? "Hide supporting evidence"
+            : "Show supporting evidence"}
+
+          {showEvidence ? (
+            <ChevronUp size={14} />
+          ) : (
+            <ChevronDown size={14} />
+          )}
+        </button>
+
+        {showEvidence && (
+          <div className="mt-3">
+            <div className="mb-2 flex flex-wrap items-center gap-2">
+              <SourceTag kind="evidence" />
+
+              <span className="text-[11px] text-slate-500">
+                Background knowledge only. It
+                did not decide this flag.
+              </span>
+            </div>
+
+            <EvidenceList
+              evidence={ingredient.evidence}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* 3. AI explanation (does not decide anything) */}
+      {aiExplanation && (
+        <div className="mt-5 rounded-xl border border-violet-400/15 bg-violet-400/[0.04] p-4">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <SourceTag kind="ai" />
+
+            {aiExplanation.source_name && (
+              <span className="text-[11px] text-slate-500">
+                {aiExplanation.source_name}
+              </span>
+            )}
+          </div>
+
+          <p className="text-sm leading-6 text-slate-300">
+            {aiExplanation.explanation}
+          </p>
+        </div>
       )}
+
+      {!aiExplanation && !aiAvailable && (
+        <p className="mt-4 text-[11px] leading-4 text-slate-600">
+          No AI explanation was generated for
+          this scan.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function FlaggedIngredientsCard({
+  ingredients,
+  insights,
+}) {
+  const flagged = ingredients.filter(
+    (ingredient) => ingredient.flagged
+  );
+
+  const explanationLookup = useMemo(() => {
+    const lookup = new Map();
+
+    for (const item of insights.ingredientExplanations) {
+      lookup.set(nameKey(item.ingredient), item);
+    }
+
+    return lookup;
+  }, [insights]);
+
+  return (
+    <GlassCard className="p-5 sm:p-6">
+      <SectionHeader
+        icon={Flag}
+        eyebrow="Flagged ingredients"
+        title={
+          flagged.length > 0
+            ? `${flagged.length} flagged ${
+                flagged.length === 1
+                  ? "ingredient"
+                  : "ingredients"
+              }`
+            : "No flagged ingredients"
+        }
+        description="Flags come from LabelIQ's deterministic rules. Evidence and AI text only explain a flag. They never change the score."
+      />
+
+      {flagged.length === 0 ? (
+        <EmptyState message="None of the ingredients matched a rule." />
+      ) : (
+        <div className="space-y-4">
+          {flagged.map((ingredient) => (
+            <FlaggedIngredient
+              key={ingredient.id}
+              ingredient={ingredient}
+              aiExplanation={
+                explanationLookup.get(
+                  nameKey(ingredient.name)
+                ) || null
+              }
+              aiAvailable={insights.hasAny}
+            />
+          ))}
+        </div>
+      )}
+    </GlassCard>
+  );
+}
+
+/*
+ * Knowledge-base context for ingredients that were NOT
+ * flagged (flagged ones show their evidence above).
+ * Hidden when there is nothing to show.
+ */
+function IngredientKnowledgeCard({
+  ingredients,
+}) {
+  const items = ingredients.filter(
+    (ingredient) =>
+      !ingredient.flagged &&
+      ingredient.evidence.length > 0
+  );
+
+  if (items.length === 0) return null;
+
+  return (
+    <GlassCard className="p-5 sm:p-6">
+      <SectionHeader
+        icon={BookOpen}
+        eyebrow="Evidence"
+        title="Ingredient knowledge"
+        description="Supporting context from the LabelIQ knowledge base for other ingredients on this label. This is information only. It is not a safety decision."
+      />
+
+      <div className="space-y-3">
+        {items.map((ingredient) => (
+          <div
+            key={ingredient.id}
+            className="rounded-xl border border-white/8 bg-black/10 p-4"
+          >
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <h3 className="font-medium text-white">
+                {ingredient.name}
+              </h3>
+
+              <SourceTag kind="evidence" />
+            </div>
+
+            <EvidenceList
+              evidence={ingredient.evidence}
+            />
+          </div>
+        ))}
+      </div>
     </GlassCard>
   );
 }
@@ -540,13 +1490,8 @@ function IngredientsCard({
    Allergens
 ========================================================= */
 
-function AllergensCard({
-  allergens,
-}) {
-  if (
-    !allergens ||
-    allergens.length === 0
-  ) {
+function AllergensCard({ allergens }) {
+  if (!allergens || allergens.length === 0) {
     return (
       <GlassCard className="p-5 sm:p-6">
         <SectionHeader
@@ -570,237 +1515,121 @@ function AllergensCard({
       />
 
       <div className="flex flex-wrap gap-2">
-        {allergens.map(
-          (allergen, index) => (
-            <span
-              key={`${allergen}-${index}`}
-              className="rounded-lg border border-amber-400/20 bg-amber-400/[0.07] px-3 py-2 text-sm text-amber-200"
-            >
-              {allergen}
-            </span>
-          )
-        )}
-      </div>
-    </GlassCard>
-  );
-}
-
-/* =========================================================
-   AI Insights
-========================================================= */
-
-function AIInsightsCard({
-  insights,
-}) {
-  const [expanded, setExpanded] =
-    useState(false);
-
-  if (
-    !insights ||
-    (!insights.summary &&
-      !insights.key_findings?.length)
-  ) {
-    return null;
-  }
-
-  return (
-    <GlassCard className="p-5 sm:p-6">
-      <div className="flex items-start justify-between gap-4">
-        <SectionHeader
-          icon={Sparkles}
-          eyebrow="AI Insights"
-          title="What the analysis found"
-        />
-
-        {insights
-          .ingredient_explanations
-          ?.length > 0 && (
-          <button
-            type="button"
-            onClick={() =>
-              setExpanded(
-                (value) => !value
-              )
-            }
-            className="shrink-0 rounded-lg border border-white/10 bg-white/[0.04] p-2 text-slate-400 transition hover:border-white/20 hover:text-white"
-            aria-label={
-              expanded
-                ? "Collapse ingredient explanations"
-                : "Expand ingredient explanations"
-            }
+        {allergens.map((allergen, index) => (
+          <span
+            key={`${allergen}-${index}`}
+            className="rounded-lg border border-amber-400/20 bg-amber-400/[0.07] px-3 py-2 text-sm text-amber-200"
           >
-            {expanded ? (
-              <ChevronUp size={17} />
-            ) : (
-              <ChevronDown size={17} />
-            )}
-          </button>
-        )}
+            {allergen}
+          </span>
+        ))}
       </div>
-
-      {insights.summary && (
-        <div className="rounded-xl border border-emerald-400/10 bg-emerald-400/[0.035] p-4">
-          <p className="text-sm leading-7 text-slate-300">
-            {insights.summary}
-          </p>
-        </div>
-      )}
-
-      {insights.key_findings
-        ?.length > 0 && (
-        <div className="mt-5">
-          <h3 className="mb-3 text-sm font-semibold text-white">
-            Key findings
-          </h3>
-
-          <div className="space-y-2.5">
-            {insights.key_findings.map(
-              (finding, index) => (
-                <div
-                  key={index}
-                  className="flex gap-3 rounded-xl border border-white/8 bg-black/10 p-3.5"
-                >
-                  <CheckCircle2
-                    size={16}
-                    className="mt-0.5 shrink-0 text-emerald-400"
-                  />
-
-                  <p className="text-sm leading-6 text-slate-400">
-                    {finding}
-                  </p>
-                </div>
-              )
-            )}
-          </div>
-        </div>
-      )}
-
-      {expanded &&
-        insights
-          .ingredient_explanations
-          ?.length > 0 && (
-          <div className="mt-5 border-t border-white/8 pt-5">
-            <h3 className="mb-3 text-sm font-semibold text-white">
-              Ingredient explanations
-            </h3>
-
-            <div className="space-y-3">
-              {insights.ingredient_explanations.map(
-                (item, index) => (
-                  <div
-                    key={`${item.ingredient}-${index}`}
-                    className="rounded-xl border border-white/8 bg-black/10 p-4"
-                  >
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <h4 className="font-medium text-white">
-                        {item.ingredient}
-                      </h4>
-
-                      {item.source_name && (
-                        <span className="text-[11px] text-emerald-300">
-                          {item.source_name}
-                        </span>
-                      )}
-                    </div>
-
-                    {item.explanation && (
-                      <p className="mt-2 text-sm leading-6 text-slate-400">
-                        {item.explanation}
-                      </p>
-                    )}
-                  </div>
-                )
-              )}
-            </div>
-          </div>
-        )}
     </GlassCard>
   );
 }
 
 /* =========================================================
-   RAG Evidence
+   AI explanation (Groq, from the backend)
+   Summary / Key findings / Ingredient explanations.
+   Presentation only: nothing is generated in the browser.
 ========================================================= */
 
-function EvidenceCard({
-  rag,
-}) {
-  const sources =
-    rag?.sources || [];
-
-  const evidenceSources =
-    sources.filter(
-      (source) =>
-        source?.evidence?.length > 0
-    );
-
-  if (
-    evidenceSources.length === 0
-  ) {
-    return null;
-  }
-
+function AIInsightsCard({ insights }) {
   return (
     <GlassCard className="p-5 sm:p-6">
       <SectionHeader
-        icon={ExternalLink}
-        eyebrow="Evidence"
-        title="Ingredient evidence"
-        description="Supporting evidence retrieved from the LabelIQ knowledge base."
+        icon={Sparkles}
+        eyebrow="AI explanation"
+        title="What the analysis found"
+        description="Written by AI to explain the rule results in plain language. It does not change the score, grade or any flag."
       />
 
-      <div className="space-y-3">
-        {evidenceSources.map(
-          (source, index) => (
-            <div
-              key={`${source.ingredient}-${index}`}
-              className="rounded-xl border border-white/8 bg-black/10 p-4"
-            >
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <h3 className="font-medium text-white">
-                  {source.ingredient}
-                </h3>
+      {!insights.hasAny ? (
+        <EmptyState
+          tone="info"
+          message="No AI explanation is available for this scan."
+        />
+      ) : (
+        <>
+          {insights.summary && (
+            <div>
+              <h3 className="mb-2 text-sm font-semibold text-white">
+                Summary
+              </h3>
 
-                <span className="text-[11px] text-emerald-300">
-                  Evidence found
-                </span>
+              <div className="rounded-xl border border-violet-400/15 bg-violet-400/[0.04] p-4">
+                <p className="text-sm leading-7 text-slate-300">
+                  {insights.summary}
+                </p>
               </div>
+            </div>
+          )}
 
-              <div className="mt-3 space-y-3">
-                {source.evidence.map(
-                  (
-                    evidence,
-                    evidenceIndex
-                  ) => (
+          {insights.keyFindings.length > 0 && (
+            <div className="mt-5">
+              <h3 className="mb-3 text-sm font-semibold text-white">
+                Key findings
+              </h3>
+
+              <div className="space-y-2.5">
+                {insights.keyFindings.map(
+                  (finding, index) => (
                     <div
-                      key={`${evidence.source_name}-${evidenceIndex}`}
-                      className="rounded-lg border border-white/8 bg-white/[0.025] p-3"
+                      key={index}
+                      className="flex gap-3 rounded-xl border border-white/8 bg-black/10 p-3.5"
                     >
-                      {evidence.source_name && (
-                        <p className="text-xs font-medium text-slate-300">
-                          {evidence.source_name}
-                        </p>
-                      )}
+                      <CheckCircle2
+                        size={16}
+                        className="mt-0.5 shrink-0 text-violet-300"
+                      />
 
-                      {evidence.evidence && (
-                        <p className="mt-2 whitespace-pre-line text-xs leading-5 text-slate-500">
-                          {evidence.evidence}
-                        </p>
-                      )}
-
-                      {evidence.source_url && (
-                        <div className="mt-2 break-all text-[11px] text-emerald-400/80">
-                          {evidence.source_url}
-                        </div>
-                      )}
+                      <p className="text-sm leading-6 text-slate-400">
+                        {finding}
+                      </p>
                     </div>
                   )
                 )}
               </div>
             </div>
-          )
-        )}
-      </div>
+          )}
+
+          {insights.ingredientExplanations
+            .length > 0 && (
+            <div className="mt-5 border-t border-white/8 pt-5">
+              <h3 className="mb-3 text-sm font-semibold text-white">
+                Ingredient explanations
+              </h3>
+
+              <div className="space-y-3">
+                {insights.ingredientExplanations.map(
+                  (item, index) => (
+                    <div
+                      key={`${item.ingredient}-${index}`}
+                      className="rounded-xl border border-white/8 bg-black/10 p-4"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h4 className="font-medium text-white">
+                          {item.ingredient}
+                        </h4>
+
+                        {item.source_name && (
+                          <span className="text-[11px] text-slate-500">
+                            {item.source_name}
+                          </span>
+                        )}
+                      </div>
+
+                      <p className="mt-2 text-sm leading-6 text-slate-400">
+                        {item.explanation}
+                      </p>
+                    </div>
+                  )
+                )}
+              </div>
+            </div>
+          )}
+        </>
+      )}
     </GlassCard>
   );
 }
@@ -812,9 +1641,7 @@ function EvidenceCard({
 function PersonalizationCard({
   personalization,
 }) {
-  if (
-    !personalization?.profileApplied
-  ) {
+  if (!personalization?.profileApplied) {
     return null;
   }
 
@@ -860,9 +1687,7 @@ function PersonalizationCard({
    OCR
 ========================================================= */
 
-function OCRCard({
-  text,
-}) {
+function OCRCard({ text }) {
   if (!text) return null;
 
   return (
@@ -912,7 +1737,8 @@ function LoadingState() {
           </h1>
 
           <p className="mx-auto mt-3 max-w-md text-sm leading-6 text-slate-400">
-            Fetching the saved analysis from LabelIQ.
+            Fetching the saved analysis from
+            LabelIQ.
           </p>
         </GlassCard>
       </div>
@@ -924,10 +1750,7 @@ function LoadingState() {
    Error State
 ========================================================= */
 
-function ErrorState({
-  message,
-  onBack,
-}) {
+function ErrorState({ message, onBack }) {
   return (
     <div className="min-h-screen bg-[#06100d] text-white">
       <div className="mx-auto flex min-h-screen max-w-3xl items-center justify-center px-5 py-12">
@@ -966,14 +1789,11 @@ function ErrorState({
 ========================================================= */
 
 export default function ScanResult() {
-  const location =
-    useLocation();
+  const location = useLocation();
 
-  const navigate =
-    useNavigate();
+  const navigate = useNavigate();
 
-  const { scanId } =
-    useParams();
+  const { scanId } = useParams();
 
   const [fetchedData, setFetchedData] =
     useState(null);
@@ -981,8 +1801,7 @@ export default function ScanResult() {
   const [loading, setLoading] =
     useState(false);
 
-  const [error, setError] =
-    useState("");
+  const [error, setError] = useState("");
 
   const [showAllIssues, setShowAllIssues] =
     useState(false);
@@ -1014,18 +1833,26 @@ export default function ScanResult() {
         setLoading(true);
         setError("");
 
-        const response =
-          await api.get(
-            `/scan/${scanId}`
-          );
+        const response = await api.get(
+          `/scan/${scanId}`
+        );
 
         if (cancelled) {
           return;
         }
 
-        setFetchedData(
-          response.data?.data || null
-        );
+        const payload = response.data?.data;
+
+        // A response that is not an object cannot be rendered.
+        if (!isPlainObject(payload)) {
+          setFetchedData(null);
+          setError(
+            "The server returned an unexpected response for this scan."
+          );
+          return;
+        }
+
+        setFetchedData(payload);
       } catch (err) {
         if (cancelled) {
           return;
@@ -1052,10 +1879,7 @@ export default function ScanResult() {
     return () => {
       cancelled = true;
     };
-  }, [
-    location.state,
-    scanId,
-  ]);
+  }, [location.state, scanId]);
 
   const data = useMemo(
     () =>
@@ -1063,10 +1887,7 @@ export default function ScanResult() {
         location.state,
         fetchedData
       ),
-    [
-      location.state,
-      fetchedData,
-    ]
+    [location.state, fetchedData]
   );
 
   /* -------------------------------------------------------
@@ -1085,9 +1906,7 @@ export default function ScanResult() {
     return (
       <ErrorState
         message={error}
-        onBack={() =>
-          navigate("/history")
-        }
+        onBack={() => navigate("/history")}
       />
     );
   }
@@ -1113,15 +1932,14 @@ export default function ScanResult() {
             </h1>
 
             <p className="mx-auto mt-3 max-w-md text-sm leading-6 text-slate-400">
-              This scan could not be loaded. Please open
-              another scan or analyze the food label again.
+              This scan could not be loaded.
+              Please open another scan or
+              analyze the food label again.
             </p>
 
             <button
               type="button"
-              onClick={() =>
-                navigate("/scan")
-              }
+              onClick={() => navigate("/scan")}
               className="mt-6 inline-flex items-center gap-2 rounded-xl bg-emerald-400 px-5 py-3 text-sm font-semibold text-[#03110c] transition hover:bg-emerald-300"
             >
               <ArrowLeft size={16} />
@@ -1135,165 +1953,153 @@ export default function ScanResult() {
 
   const {
     aiAnalysis,
-    rag,
+    aiInsights,
     analysis,
     database,
     ocr,
   } = data;
 
-  const nutrition = {
-    ...(aiAnalysis.nutrition || {}),
-  };
+  const nutrition = isPlainObject(
+    aiAnalysis.nutrition
+  )
+    ? aiAnalysis.nutrition
+    : {};
 
-  /*
-   * Historical scans contain the saved health profile.
-   * Attach the sugar threshold so NutritionCard can still
-   * highlight the value when appropriate.
-   */
-  if (
-    analysis.healthProfile
-      ?.max_sugar_threshold !== null &&
-    analysis.healthProfile
-      ?.max_sugar_threshold !== undefined
-  ) {
-    nutrition.__sugarThreshold =
-      Number(
-        analysis.healthProfile
-          .max_sugar_threshold
-      );
-  }
+  const nutritionMeta = isPlainObject(
+    aiAnalysis.nutrition_meta
+  )
+    ? aiAnalysis.nutrition_meta
+    : null;
+
+  const nutritionConverted = isPlainObject(
+    aiAnalysis.nutrition_converted
+  )
+    ? aiAnalysis.nutrition_converted
+    : null;
 
   const ingredients =
-    Array.isArray(
+    normalizeIngredientDetails(
+      aiAnalysis.ingredient_details,
       aiAnalysis.ingredients
-    )
-      ? aiAnalysis.ingredients
-      : [];
+    );
 
-  const allergens =
-    Array.isArray(
-      aiAnalysis.allergens
-    )
-      ? aiAnalysis.allergens
-      : [];
+  const insights = normalizeInsights(
+    aiInsights
+  );
 
-  const ruleMatches =
-    Array.isArray(
-      analysis.ruleMatches
-    )
-      ? analysis.ruleMatches
-      : [];
+  const allergens = asArray(
+    aiAnalysis.allergens
+  );
 
-  const breakdown =
-    analysis.breakdown || {};
+  const ruleMatches = asArray(
+    analysis.ruleMatches
+  );
 
-  const grade = String(
-    analysis.safetyGrade || "—"
+  const breakdown = isPlainObject(
+    analysis.breakdown
+  )
+    ? analysis.breakdown
+    : {};
+
+  /* Score and grade are the backend's values, shown as-is. */
+  const rawGrade = String(
+    analysis.safetyGrade || ""
   ).toUpperCase();
 
+  const grade = gradeConfig[rawGrade]
+    ? rawGrade
+    : "—";
+
   const gradeInfo =
-    gradeConfig[grade] ||
-    gradeConfig.D;
+    gradeConfig[rawGrade] ||
+    gradeUnavailable;
 
-  const issueCount =
-    ruleMatches.length;
+  const issueCount = ruleMatches.length;
 
-  const allIssueGroups = [
+  const generalGroup = {
+    title: "General ingredient issues",
+
+    description:
+      "General rules matched against the detected ingredient list.",
+
+    items: asArray(breakdown.generalIssues),
+
+    icon: AlertTriangle,
+  };
+
+  const personalGroups = [
     {
-      title:
-        "General ingredient issues",
-
-      description:
-        "General rules matched against the detected ingredient list.",
-
-      items:
-        breakdown.generalIssues ||
-        [],
-
-      icon: AlertTriangle,
-    },
-
-    {
-      title:
-        "Personal blocklist",
+      title: "Personal blocklist",
 
       description:
         "Ingredients matched against your personal blocklist.",
 
-      items:
-        breakdown.blocklistIssues ||
-        [],
+      items: asArray(
+        breakdown.blocklistIssues
+      ),
 
       icon: ShieldAlert,
     },
 
     {
-      title:
-        "Sugar limits",
+      title: "Sugar limit",
 
       description:
         "Nutrition values compared with your configured sugar threshold.",
 
-      items:
-        breakdown.sugarIssues ||
-        [],
+      items: asArray(breakdown.sugarIssues),
 
       icon: Sparkles,
     },
 
     {
-      title:
-        "Calorie limits",
+      title: "Calorie limit",
 
       description:
         "Nutrition values compared with your configured calorie limit.",
 
-      items:
-        breakdown.calorieIssues ||
-        [],
+      items: asArray(breakdown.calorieIssues),
 
       icon: Flame,
     },
 
     {
-      title:
-        "Sodium limits",
+      title: "Sodium limit",
 
       description:
         "Nutrition values compared with your configured sodium threshold.",
 
-      items:
-        breakdown.sodiumIssues ||
-        [],
+      items: asArray(breakdown.sodiumIssues),
 
       icon: Droplets,
     },
 
     {
-      title:
-        "Dietary conflicts",
+      title: "Dietary conflict",
 
       description:
         "Ingredients that conflict with your selected dietary mode.",
 
-      items:
-        breakdown.dietaryConflicts ||
-        [],
+      items: asArray(
+        breakdown.dietaryConflicts
+      ),
 
       icon: Leaf,
     },
   ];
 
-  const visibleIssueGroups =
-    showAllIssues
-      ? allIssueGroups
-      : allIssueGroups.filter(
-          (group) =>
-            group.items.length > 0
-        );
+  const allIssueGroups = [
+    generalGroup,
+    ...personalGroups,
+  ];
 
-  const hasIssues =
-    issueCount > 0;
+  const visibleIssueGroups = showAllIssues
+    ? allIssueGroups
+    : allIssueGroups.filter(
+        (group) => group.items.length > 0
+      );
+
+  const hasIssues = issueCount > 0;
 
   return (
     <div className="relative min-h-screen overflow-hidden bg-[#06100d] text-white">
@@ -1308,8 +2114,7 @@ export default function ScanResult() {
           style={{
             backgroundImage:
               "linear-gradient(rgba(255,255,255,.7) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.7) 1px, transparent 1px)",
-            backgroundSize:
-              "48px 48px",
+            backgroundSize: "48px 48px",
           }}
         />
       </div>
@@ -1338,9 +2143,7 @@ export default function ScanResult() {
 
           <button
             type="button"
-            onClick={() =>
-              navigate("/scan")
-            }
+            onClick={() => navigate("/scan")}
             className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-3.5 py-2 text-sm font-medium text-slate-300 transition hover:border-white/20 hover:bg-white/[0.07] hover:text-white"
           >
             <ArrowLeft size={15} />
@@ -1378,9 +2181,7 @@ export default function ScanResult() {
                     <span className="mx-2 text-slate-700">
                       •
                     </span>
-
-                    Scan #
-                    {database.scanId}
+                    Scan #{database.scanId}
                   </>
                 )}
               </p>
@@ -1422,7 +2223,7 @@ export default function ScanResult() {
 
                 <div className="flex-1 text-center sm:text-left">
                   <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
-                    Safety score
+                    Health score
                   </p>
 
                   <div className="mt-1 flex items-baseline justify-center gap-2 sm:justify-start">
@@ -1440,6 +2241,12 @@ export default function ScanResult() {
                   <p className="mt-3 text-sm leading-6 text-slate-400">
                     {analysis.assessment ||
                       "The product has been analyzed against the available rules and your profile."}
+                  </p>
+
+                  <p className="mt-2 text-[11px] leading-4 text-slate-600">
+                    Score and grade are calculated
+                    by LabelIQ's deterministic
+                    rule engine.
                   </p>
                 </div>
               </div>
@@ -1508,11 +2315,13 @@ export default function ScanResult() {
             </h2>
 
             <p className="mt-2 text-sm leading-6 text-slate-400">
-              This analysis considers the preferences configured
-              in your LabelIQ health profile.
+              This analysis considers the
+              preferences configured in your
+              LabelIQ health profile.
             </p>
 
-            {analysis.personalization?.profileApplied ? (
+            {analysis.personalization
+              ?.profileApplied ? (
               <div className="mt-6 space-y-3">
                 <div className="flex items-center justify-between rounded-xl border border-white/8 bg-black/10 px-4 py-3">
                   <span className="text-sm text-slate-500">
@@ -1553,8 +2362,10 @@ export default function ScanResult() {
                       </p>
 
                       <p className="mt-1 text-xs leading-5 text-amber-200/60">
-                        A sugar-related ingredient rule was
-                        triggered in the ingredient analysis.
+                        A sugar-related
+                        ingredient rule was
+                        triggered in the
+                        ingredient analysis.
                       </p>
                     </div>
                   </div>
@@ -1562,8 +2373,8 @@ export default function ScanResult() {
               </div>
             ) : (
               <div className="mt-6 rounded-xl border border-white/8 bg-black/10 p-4 text-sm text-slate-500">
-                No personal health profile was applied to
-                this analysis.
+                No personal health profile was
+                applied to this analysis.
               </div>
             )}
           </GlassCard>
@@ -1572,7 +2383,37 @@ export default function ScanResult() {
         {/* Main content */}
         <div className="mt-6 grid gap-6 lg:grid-cols-[1.25fr_0.75fr]">
           <div className="space-y-6">
-            {/* Issues */}
+            {/* Nutrition */}
+            <NutritionCard
+              nutrition={nutrition}
+              meta={nutritionMeta}
+              converted={nutritionConverted}
+              breakdown={breakdown}
+            />
+
+            {/* Ingredients */}
+            <IngredientsCard
+              ingredients={ingredients}
+            />
+
+            {/* Flagged ingredients:
+                rule decision -> evidence -> AI explanation */}
+            {ingredients.length > 0 && (
+              <FlaggedIngredientsCard
+                ingredients={ingredients}
+                insights={insights}
+              />
+            )}
+
+            {/* Personalized warnings */}
+            <PersonalizedWarningsCard
+              groups={personalGroups}
+              personalization={
+                analysis.personalization
+              }
+            />
+
+            {/* Rule engine breakdown */}
             <GlassCard className="p-5 sm:p-6">
               <SectionHeader
                 icon={
@@ -1583,12 +2424,12 @@ export default function ScanResult() {
                 eyebrow="Rule engine"
                 title={
                   hasIssues
-                    ? "Issues that need attention"
+                    ? "Rule breakdown"
                     : "No rule violations detected"
                 }
                 description={
                   hasIssues
-                    ? "These findings come directly from the deterministic rules applied by LabelIQ."
+                    ? "Every rule that affected this analysis. These findings come directly from the deterministic rules applied by LabelIQ."
                     : "The configured rules did not identify any issues for this product."
                 }
               />
@@ -1613,15 +2454,13 @@ export default function ScanResult() {
 
                   {allIssueGroups.some(
                     (group) =>
-                      group.items.length ===
-                      0
+                      group.items.length === 0
                   ) && (
                     <button
                       type="button"
                       onClick={() =>
                         setShowAllIssues(
-                          (value) =>
-                            !value
+                          (value) => !value
                         )
                       }
                       className="mt-6 inline-flex items-center gap-2 text-xs font-medium text-emerald-300 transition hover:text-emerald-200"
@@ -1631,13 +2470,9 @@ export default function ScanResult() {
                         : "Show all rule categories"}
 
                       {showAllIssues ? (
-                        <ChevronUp
-                          size={14}
-                        />
+                        <ChevronUp size={14} />
                       ) : (
-                        <ChevronDown
-                          size={14}
-                        />
+                        <ChevronDown size={14} />
                       )}
                     </button>
                   )}
@@ -1647,41 +2482,26 @@ export default function ScanResult() {
               )}
             </GlassCard>
 
-            {/* Nutrition */}
-            <NutritionCard
-              nutrition={nutrition}
+            {/* Evidence for the other ingredients */}
+            <IngredientKnowledgeCard
+              ingredients={ingredients}
             />
 
-            {/* Ingredients */}
-            <IngredientsCard
-              ingredients={
-                ingredients
-              }
-              ruleMatches={
-                ruleMatches
-              }
-            />
-
-            {/* AI */}
+            {/* AI explanation */}
             <AIInsightsCard
-              insights={
-                aiAnalysis.ai_insights
-              }
-            />
-
-            {/* Evidence */}
-            <EvidenceCard
-              rag={rag}
+              insights={insights}
             />
 
             {/* OCR */}
-            <OCRCard
-              text={ocr.text}
-            />
+            <OCRCard text={ocr.text} />
           </div>
 
           {/* Sidebar */}
           <aside className="space-y-6">
+            <ProductInfoCard
+              aiAnalysis={aiAnalysis}
+            />
+
             <AllergensCard
               allergens={allergens}
             />
@@ -1758,15 +2578,15 @@ export default function ScanResult() {
               </h3>
 
               <p className="mt-1.5 text-sm leading-6 text-slate-500">
-                Scan another food product to compare its
-                ingredients, nutrition and personalized findings.
+                Scan another food product to
+                compare its ingredients,
+                nutrition and personalized
+                findings.
               </p>
 
               <button
                 type="button"
-                onClick={() =>
-                  navigate("/scan")
-                }
+                onClick={() => navigate("/scan")}
                 className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl bg-emerald-400 px-4 py-3 text-sm font-semibold text-[#03110c] transition hover:bg-emerald-300"
               >
                 <Zap size={15} />
@@ -1779,9 +2599,11 @@ export default function ScanResult() {
         {/* Footer note */}
         <div className="mt-8 border-t border-white/8 pt-6 text-center">
           <p className="text-xs leading-5 text-slate-600">
-            LabelIQ provides label analysis and personalized
-            rule-based insights. Always review the original
-            product packaging for the most current information.
+            LabelIQ provides label analysis and
+            personalized rule-based insights.
+            Always review the original product
+            packaging for the most current
+            information.
           </p>
         </div>
       </main>
