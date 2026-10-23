@@ -71,7 +71,7 @@ Module._load = function (request, parent, isMain) {
     return originalLoad.apply(this, arguments);
 };
 
-const rules = require("../../services/healthRules.service");
+const rules = require("./healthRules.service.js");
 const scanService = require(SCAN_SERVICE);
 const profileService = require(PROFILE_SERVICE);
 

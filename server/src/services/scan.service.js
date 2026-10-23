@@ -18,7 +18,7 @@ const {
     getMatchCategory,
     isHiddenSugarCode,
     categorizeMatches,
-} = require("./healthRules.service");
+} = require("../ai/health/healthRules.service");
 
 // ============================================
 // CONSTANTS
