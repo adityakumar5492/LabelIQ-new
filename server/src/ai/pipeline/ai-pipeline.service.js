@@ -286,8 +286,15 @@ async function analyzeImage(imageBuffer) {
             .trim()
             .replace(/\s+/g, " ");
 
-        const evidence =
-            getIngredientEvidence(cleanIngredient);
+        // RAG evidence is optional. If it fails, this ingredient simply
+        // has no evidence; the scan and the deterministic score continue.
+        let evidence = [];
+
+        try {
+            evidence = getIngredientEvidence(cleanIngredient);
+        } catch (error) {
+            console.error("RAG evidence failed:", error.message);
+        }
 
         ingredientEvidence.push({
             ingredient: cleanIngredient,

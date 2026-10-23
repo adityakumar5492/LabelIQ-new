@@ -6,9 +6,18 @@ const knowledgePath = path.join(
     "ingredient-knowledge.json"
 );
 
-const knowledge = JSON.parse(
-    fs.readFileSync(knowledgePath, "utf-8")
-);
+// RAG is an evidence layer only. A missing or corrupt knowledge file
+// must never stop the app or a scan, and never affects the health
+// score, so it degrades to "no evidence".
+let knowledge = [];
+
+try {
+    const parsed = JSON.parse(fs.readFileSync(knowledgePath, "utf-8"));
+
+    knowledge = Array.isArray(parsed) ? parsed : [];
+} catch (error) {
+    console.error("RAG knowledge base could not be loaded:", error.message);
+}
 
 // A partial query (e.g. "sodium") may only match a longer knowledge
 // name (e.g. "sodium benzoate") when it covers most of that name.
@@ -98,15 +107,22 @@ function searchKnowledge(query, topK = 3) {
 }
 
 function getIngredientEvidence(ingredient) {
-    const results = searchKnowledge(ingredient, 3);
+    try {
+        const results = searchKnowledge(ingredient, 3);
 
-    return results.map((item) => ({
-        ingredient: item.name,
-        description: item.description,
-        purpose: item.purpose,
-        source: item.source,
-        score: item.score,
-    }));
+        return results.map((item) => ({
+            ingredient: item.name,
+            description: item.description,
+            purpose: item.purpose,
+            source: item.source,
+            score: item.score,
+        }));
+    } catch (error) {
+        // RAG failure = no evidence. Never an error for the scan.
+        console.error("RAG evidence lookup failed:", error.message);
+
+        return [];
+    }
 }
 
 module.exports = {

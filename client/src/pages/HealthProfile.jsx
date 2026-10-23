@@ -25,6 +25,8 @@ const DEFAULT_PROFILE = {
   analysisStrictness: "moderate",
 };
 
+// These values are exactly what the backend rule engine understands
+// (see healthRules.service.js and healthProfile.validator.js).
 const DIETARY_OPTIONS = [
   {
     value: "none",
@@ -36,23 +38,29 @@ const DIETARY_OPTIONS = [
     value: "vegan",
     label: "Vegan",
     description:
-      "Flag ingredients that conflict with a vegan diet.",
+      "Flag animal-derived ingredients such as milk, egg, honey and gelatin.",
   },
   {
-    value: "vegetarian",
-    label: "Vegetarian",
+    value: "gluten-free",
+    label: "Gluten-free",
     description:
-      "Flag ingredients that conflict with a vegetarian diet.",
+      "Flag wheat, barley, rye, malt and other gluten ingredients.",
+  },
+  {
+    value: "keto",
+    label: "Keto",
+    description:
+      "Flag sugar and sugar-type ingredients such as dextrose and syrups.",
+  },
+  {
+    value: "type-2-diabetic",
+    label: "Type 2 diabetic",
+    description:
+      "Flag sugar-type ingredients and declared added sugars.",
   },
 ];
 
 const STRICTNESS_OPTIONS = [
-  {
-    value: "low",
-    label: "Low",
-    description:
-      "Focus mainly on stronger and clearer concerns.",
-  },
   {
     value: "moderate",
     label: "Moderate",
@@ -60,16 +68,32 @@ const STRICTNESS_OPTIONS = [
       "Balanced analysis for everyday food decisions.",
   },
   {
-    value: "high",
-    label: "High",
+    value: "strict",
+    label: "Strict",
     description:
-      "Apply stricter rules to potential concerns.",
+      "Apply higher penalties to your personal limits, blocklist and diet.",
   },
 ];
+
+const DIETARY_VALUES = DIETARY_OPTIONS.map(
+  (option) => option.value
+);
+
+const STRICTNESS_VALUES = STRICTNESS_OPTIONS.map(
+  (option) => option.value
+);
 
 /* =========================================================
    Helpers
 ========================================================= */
+
+// A stored value the engine does not support (for example an old
+// "vegetarian") is shown as the default instead of an empty choice.
+const normalizeChoice = (value, allowed, fallback) => {
+  const text = String(value ?? "").trim().toLowerCase();
+
+  return allowed.includes(text) ? text : fallback;
+};
 
 const normalizeProfile = (profile) => {
   if (!profile) {
@@ -92,28 +116,31 @@ const normalizeProfile = (profile) => {
       profile.maxSodiumThreshold ??
       "",
 
-    dietaryMode:
-      profile.dietary_mode ??
-      profile.dietaryMode ??
-      "none",
-
-    analysisStrictness:
+    dietaryMode: normalizeChoice(
+      profile.dietary_mode ?? profile.dietaryMode,
+      DIETARY_VALUES,
+      "none"
+    ),
+    analysisStrictness: normalizeChoice(
       profile.analysis_strictness ??
-      profile.analysisStrictness ??
-      "moderate",
+        profile.analysisStrictness,
+      STRICTNESS_VALUES,
+      "moderate"
+    ),
   };
 };
 
 const validateProfile = (profile) => {
   const errors = {};
 
+  // The server accepts a positive whole number of kcal.
   if (
     profile.calorieLimit !== "" &&
-    (!Number.isFinite(Number(profile.calorieLimit)) ||
-      Number(profile.calorieLimit) < 0)
+    (!Number.isInteger(Number(profile.calorieLimit)) ||
+      Number(profile.calorieLimit) <= 0)
   ) {
     errors.calorieLimit =
-      "Enter a valid calorie limit.";
+      "Enter a whole number greater than 0.";
   }
 
   if (
@@ -138,19 +165,13 @@ const validateProfile = (profile) => {
       "Enter a valid sodium threshold.";
   }
 
-  if (
-    !["none", "vegan", "vegetarian"].includes(
-      profile.dietaryMode
-    )
-  ) {
+  if (!DIETARY_VALUES.includes(profile.dietaryMode)) {
     errors.dietaryMode =
       "Select a valid dietary preference.";
   }
 
   if (
-    !["low", "moderate", "high"].includes(
-      profile.analysisStrictness
-    )
+    !STRICTNESS_VALUES.includes(profile.analysisStrictness)
   ) {
     errors.analysisStrictness =
       "Select a valid analysis strictness.";
@@ -681,7 +702,7 @@ export default function HealthProfile() {
               description="Choose the dietary mode that LabelIQ should consider when evaluating ingredients."
             />
 
-            <div className="mt-6 grid gap-3 md:grid-cols-3">
+            <div className="mt-6 grid gap-3 md:grid-cols-2 lg:grid-cols-3">
               {DIETARY_OPTIONS.map((option) => (
                 <OptionCard
                   key={option.value}
@@ -719,7 +740,7 @@ export default function HealthProfile() {
               description="Control how strictly LabelIQ applies personalized rules to your scans."
             />
 
-            <div className="mt-6 grid gap-3 md:grid-cols-3">
+            <div className="mt-6 grid gap-3 md:grid-cols-2">
               {STRICTNESS_OPTIONS.map(
                 (option) => (
                   <OptionCard
