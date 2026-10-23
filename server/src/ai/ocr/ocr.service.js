@@ -240,11 +240,158 @@ async function preprocessContrast(imageBuffer) {
         .toBuffer();
 }
 
+// Light text on a dark panel (very common for nutrition tables on
+// chocolate / snack boxes) is read much better after inversion.
+async function preprocessInverted(imageBuffer) {
+    return await sharp(imageBuffer)
+        .rotate()
+        .resize({ width: 3000, withoutEnlargement: false })
+        .grayscale()
+        .negate()
+        .normalize()
+        .sharpen()
+        .png()
+        .toBuffer();
+}
+
 const PASSES = [
-    { name: "base", psm: "3", prepare: preprocessImage },
-    { name: "large-uniform", psm: "6", prepare: preprocessLarge },
-    { name: "contrast-columns", psm: "4", prepare: preprocessContrast },
+    { name: "base", psm: "3", width: 2000, prepare: preprocessImage },
+    { name: "large-uniform", psm: "6", width: 3000, prepare: preprocessLarge },
+    { name: "contrast-columns", psm: "4", width: 2600, prepare: preprocessContrast },
+    { name: "inverted-columns", psm: "4", width: 3000, prepare: preprocessInverted },
 ];
+
+/* ------------------------------------------------------------------ */
+/* Nutrition-table crop (second stage)                                */
+/* ------------------------------------------------------------------ */
+
+// Finds the "Nutrition Information" header in an already-recognised
+// pass, crops the table out of the ORIGINAL image and OCRs just that
+// region at high magnification. Returns null when no header is found.
+function findTableRegion(pass, passWidth, rotatedWidth, rotatedHeight) {
+    const words = (pass.words || []).filter((w) => w && w.bbox && w.text);
+
+    const header = words.find((w) => {
+        const l = String(w.text).toLowerCase().replace(/[^a-z]/g, "");
+
+        return l.length >= 8 && /^nutrit/.test(l);
+    });
+
+    if (!header) {
+        return null;
+    }
+
+    const scale = rotatedWidth / passWidth;
+    const hh = Math.max(8, header.bbox.y1 - header.bbox.y0);
+
+    const sameRow = words.filter(
+        (w) =>
+            Math.abs((w.bbox.y0 + w.bbox.y1) / 2 - (header.bbox.y0 + header.bbox.y1) / 2) <= hh * 0.7 &&
+            w.bbox.x0 >= header.bbox.x0 - hh &&
+            w.bbox.x0 <= header.bbox.x0 + passWidth * 0.4
+    );
+
+    const right = Math.max(header.bbox.x1, ...sameRow.map((w) => w.bbox.x1));
+
+    const reference = words.find((w) => {
+        const l = String(w.text).toLowerCase().replace(/[^a-z]/g, "");
+
+        return (
+            /^refer/.test(l) &&
+            w.bbox.y0 > header.bbox.y1 &&
+            w.bbox.y0 < header.bbox.y1 + hh * 30
+        );
+    });
+
+    const bottom = reference
+        ? reference.bbox.y0
+        : header.bbox.y1 + hh * 14;
+
+    const left = Math.max(0, (header.bbox.x0 - hh * 1.2) * scale);
+    const top = Math.max(0, (header.bbox.y0 - hh * 0.8) * scale);
+    const width = Math.min(rotatedWidth - left, (right - header.bbox.x0 + hh * 2.4) * scale);
+    const height = Math.min(rotatedHeight - top, (bottom - header.bbox.y0 + hh * 0.8) * scale);
+
+    if (width < 80 || height < 60) {
+        return null;
+    }
+
+    return {
+        left: Math.round(left),
+        top: Math.round(top),
+        width: Math.round(width),
+        height: Math.round(height),
+    };
+}
+
+async function tableCropPasses(imageBuffer, results, worker, major) {
+    const out = [];
+
+    try {
+        const rotated = await sharp(imageBuffer).rotate().toBuffer();
+        const meta = await sharp(rotated).metadata();
+
+        let region = null;
+
+        for (const def of PASSES) {
+            const pass = results.find((r) => r.name === def.name);
+
+            if (pass && pass.words && pass.words.length) {
+                region = findTableRegion(pass, def.width, meta.width, meta.height);
+
+                if (region) {
+                    break;
+                }
+            }
+        }
+
+        if (!region) {
+            return out;
+        }
+
+        // Two magnifications: tiny digits and thin glyphs are read best
+        // at different scales, and the parser votes across passes.
+        for (const width of [1800, 1000]) {
+            const crop = await sharp(rotated)
+                .extract(region)
+                .resize({ width, withoutEnlargement: false })
+                .grayscale()
+                .normalize()
+                .sharpen()
+                .png()
+                .toBuffer();
+
+            for (const psm of ["6", "4"]) {
+                await worker.setParameters({ tessedit_pageseg_mode: psm });
+
+                const r = await recognizeOnce(worker, crop, major);
+
+                out.push({
+                    name: `table-crop-${width}-psm${psm}`,
+                    psm,
+                    text: r.text,
+                    words: r.words,
+                    meta: {
+                        wordSource: r.wordSource,
+                        wordCount: r.words.length,
+                        dataKeys: r.dataKeys,
+                        region,
+                    },
+                });
+            }
+        }
+    } catch (error) {
+        out.push({
+            name: "table-crop",
+            psm: null,
+            text: "",
+            words: [],
+            meta: { error: error.message, wordSource: "none", wordCount: 0 },
+        });
+    }
+
+    return out;
+}
 
 /* ------------------------------------------------------------------ */
 /* Recognition                                                        */
@@ -335,6 +482,12 @@ async function extractOCR(imageBuffer, options = {}) {
                     },
                 });
             }
+        }
+
+        if (multiPass) {
+            const crops = await tableCropPasses(imageBuffer, results, worker, major);
+
+            results.push(...crops);
         }
 
         const primary = results[0];

@@ -214,15 +214,35 @@ function parseQuantityToken(raw) {
         return null;
     }
 
-    const intPart = m[1].split(/[.,]/)[0];
-    const unit = canonicalUnit(m[2]);
+    let numText = m[1];
+    let rawUnit = m[2];
+    let unitRecovered = false;
+
+    // OCR often reads the trailing "g" of "3.4g" / "0.06g" as "9"
+    // ("3.49", "0.069"). A decimal number with NO unit that ends in 9
+    // is read as "<number without the 9> g". Cross-column consistency
+    // and plausibility checks still apply afterwards.
+    if (
+        !rawUnit &&
+        /^\d+[.,]\d*9$/.test(numText) &&
+        /^\d+[.,]\d+$/.test(numText.slice(0, -1))
+    ) {
+        numText = numText.slice(0, -1);
+        rawUnit = "g";
+        unitRecovered = true;
+    }
+
+    const intPart = numText.split(/[.,]/)[0];
+    const unit = canonicalUnit(rawUnit);
 
     // "006", "020": a dropped decimal point, cannot be trusted.
     const leadingZero = /^0\d/.test(intPart);
 
     return {
         ri: false,
-        number: Number(m[1].replace(",", ".")),
+        number: Number(numText.replace(",", ".")),
+        hasDecimal: /[.,]\d/.test(numText),
+        unitRecovered,
         unit: unit || "",
         unitUnknown: unit === null,
         invalid: leadingZero || unit === null,
@@ -308,33 +328,53 @@ function wordsFromText(text) {
 }
 
 // "1822kJ/436kcal" -> two tokens
+// "/100g/32g/(%**)"  -> "/100g", "/32g" (reference-intake part dropped)
 function splitGlued(word) {
     if (!word.text.includes("/")) {
         return [word];
     }
 
-    const parts = word.text.split("/");
+    const rawParts = word.text.split("/");
+    const isAmount = (p) =>
+        /^\d+(?:[.,]\d+)?[A-Za-z1µμ]{1,5}$/.test(p.replace(/[()|]/g, ""));
+    const isRi = (p) => /%/.test(p);
 
-    const ok = parts.every((p) =>
-        /^\d+(?:[.,]\d+)?[A-Za-z1µμ]{1,5}$/.test(p.replace(/[()|]/g, ""))
-    );
+    const nonEmpty = rawParts.filter((p) => p !== "");
+    const amounts = nonEmpty.filter(isAmount);
+    const allKnown = nonEmpty.every((p) => isAmount(p) || isRi(p));
+    const headerLike = rawParts[0] === "" || nonEmpty.some(isRi);
 
-    if (parts.length < 2 || !ok) {
+    if (!allKnown || amounts.length < 2 || nonEmpty.length < 2) {
         return [word];
     }
 
     const total = word.text.length;
     const width = word.x1 - word.x0;
+    const out = [];
     let offset = 0;
 
-    return parts.map((p) => {
-        const x0 = word.x0 + (offset / total) * width;
-        const x1 = word.x0 + ((offset + p.length) / total) * width;
+    for (const p of rawParts) {
+        const start = offset;
 
         offset += p.length + 1;
 
-        return { ...word, text: p, x0, x1, xc: (x0 + x1) / 2 };
-    });
+        if (!isAmount(p)) {
+            continue;
+        }
+
+        const x0 = word.x0 + (start / total) * width;
+        const x1 = word.x0 + ((start + p.length) / total) * width;
+
+        out.push({
+            ...word,
+            text: headerLike ? "/" + p : p,
+            x0,
+            x1,
+            xc: (x0 + x1) / 2,
+        });
+    }
+
+    return out;
 }
 
 function mergeNumberUnit(tokens, H) {
@@ -443,7 +483,7 @@ function annotateRow(row) {
         if (t.q && !t.q.ri) {
             // A stray unit-less number before any label text
             // (e.g. "3 Carbohydrate") is label noise, not a value.
-            if (t.q.unit || firstAlpha) {
+            if (t.q.unit || firstAlpha || t.q.hasDecimal) {
                 split = i;
                 break;
             }
@@ -1006,7 +1046,18 @@ function resolveValue(key, token, hintUnit) {
         return null;
     }
 
-    const unit = q.unit || hintUnit || null;
+    let unit = q.unit || hintUnit || null;
+
+    // Protein, fat, saturates, carbohydrate, sugars, fibre and salt are
+    // always printed in grams. A bare decimal ("6.5") whose "g" was lost
+    // to OCR is therefore read as grams. Calories and sodium never are.
+    if (
+        !unit &&
+        q.hasDecimal &&
+        ["protein", "carbohydrates", "totalFat", "saturatedFat", "sugar", "fiber", "salt"].includes(key)
+    ) {
+        unit = "g";
+    }
 
     if (!unit) {
         return null;
@@ -1066,6 +1117,137 @@ function decimalStep(v) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Dropped-decimal repair (serving value paired with its per-100 value) */
+/* ------------------------------------------------------------------ */
+
+const GRAM_KEYS = [
+    "protein",
+    "carbohydrates",
+    "totalFat",
+    "saturatedFat",
+    "sugar",
+    "fiber",
+    "salt",
+];
+
+/**
+ * OCR frequently drops the decimal point and misreads "g":
+ *   "3.4g" -> "34g" / "349",  "0.06g" -> "006g",  "5.0g" -> "50g".
+ * Returns every plausible numeric reading of a token with a cost
+ * (0 = most literal reading, higher = more OCR damage assumed).
+ */
+function readingCandidates(tok) {
+    const raw = String(tok?.text || "")
+        .replace(/\(.*$/, "")
+        .replace(/^[|~_:*\-–—¥•]+/, "")
+        .replace(/[|~_:*,;\])]+$/, "");
+
+    const m = raw.match(/^(\d+(?:[.,]\d+)?)\s*([A-Za-z1µμ]{0,3})$/);
+
+    if (!m) {
+        return [];
+    }
+
+    const num = m[1].replace(",", ".");
+    const unit = m[2].toLowerCase();
+
+    if (unit && !["g", "q", "gr"].includes(unit)) {
+        return [];
+    }
+
+    const bases = [];
+
+    if (unit) {
+        bases.push({ s: num, c: 0 });
+    } else if (num.includes(".")) {
+        bases.push({ s: num, c: 0 });
+
+        if (num.endsWith("9") && /^\d+\.\d+$/.test(num.slice(0, -1))) {
+            bases.push({ s: num.slice(0, -1), c: 0 });
+        }
+    } else {
+        // Unit-less integer: only readable when its last digit is the
+        // "g" misread as "9" ("349" -> 34g). Anything else is a guess.
+        if (num.length >= 3 && num.endsWith("9")) {
+            bases.push({ s: num.slice(0, -1), c: 1 });
+        }
+    }
+
+    const byValue = new Map();
+
+    const add = (value, cost) => {
+        if (!Number.isFinite(value) || value < 0) return;
+
+        const prev = byValue.get(value);
+
+        if (prev === undefined || cost < prev) {
+            byValue.set(value, cost);
+        }
+    };
+
+    for (const { s: base, c } of bases) {
+        if (base.includes(".")) {
+            add(Number(base), c);
+        } else if (base.length > 1 && base[0] === "0") {
+            // "006" / "020": always a dropped point after the leading 0.
+            add(Number("0." + base.slice(1)), c);
+        } else {
+            add(Number(base), c);
+
+            for (let p = 1; p < base.length; p++) {
+                add(Number(base.slice(0, p) + "." + base.slice(p)), c + 1);
+            }
+        }
+    }
+
+    return [...byValue.entries()].map(([value, cost]) => ({ value, cost }));
+}
+
+/**
+ * Pick the target reading that agrees with the per-100 reading at the
+ * serving ratio. Returns null unless exactly one cheapest pair exists.
+ */
+function repairWithReference(targetTok, refTok, ratio, maxTarget, maxRef) {
+    if (!targetTok || !refTok || !ratio) {
+        return null;
+    }
+
+    for (const t of [targetTok, refTok]) {
+        if (t.conf !== null && t.conf !== undefined && t.conf < MIN_NUMERIC_CONFIDENCE) {
+            return null;
+        }
+    }
+
+    const targets = readingCandidates(targetTok);
+    const refs = readingCandidates(refTok);
+    const pairs = [];
+
+    for (const r of refs) {
+        if (r.value > maxRef) continue;
+
+        for (const t of targets) {
+            if (t.value > maxTarget) continue;
+
+            const expected = r.value * ratio;
+            const tolerance = 0.15 * expected + 0.06;
+
+            if (Math.abs(t.value - expected) <= tolerance) {
+                pairs.push({ value: t.value, cost: t.cost + r.cost });
+            }
+        }
+    }
+
+    if (!pairs.length) {
+        return null;
+    }
+
+    const min = Math.min(...pairs.map((p) => p.cost));
+    const best = new Set(pairs.filter((p) => p.cost === min).map((p) => p.value));
+
+    return best.size === 1 ? [...best][0] : null;
+}
+
+/* ------------------------------------------------------------------ */
 /* Validation                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -1098,6 +1280,43 @@ function validateNutrition(nutrition) {
     }
 
     return result;
+}
+
+/**
+ * Physical sanity check. Fat + carbohydrate + protein + fibre + salt
+ * can never weigh more than the amount they were measured in (a 32g bar
+ * cannot hold 52g of them). When the set is impossible and removing
+ * exactly ONE nutrient makes it possible, that nutrient (a value whose
+ * decimal point was lost, e.g. "2.6g" read as "26g") is set to null.
+ * If no single removal resolves it, nothing is changed.
+ */
+function enforceMassBudget(nutrition, amount, unit, warnings) {
+    if (!nutrition || unit !== "g" || !Number.isFinite(amount) || amount <= 0) {
+        return nutrition;
+    }
+
+    const keys = ["totalFat", "carbohydrates", "protein", "fiber", "salt"];
+    const present = keys.filter((k) => nutrition[k] !== null && nutrition[k] !== undefined);
+    const total = present.reduce((sum, k) => sum + nutrition[k], 0);
+    const limit = amount * 1.03 + 0.5;
+
+    if (total <= limit) {
+        return nutrition;
+    }
+
+    const fixers = present.filter((k) => total - nutrition[k] <= limit);
+
+    if (fixers.length !== 1) {
+        return nutrition;
+    }
+
+    if (Array.isArray(warnings)) {
+        warnings.push(
+            `${fixers[0]} (${nutrition[fixers[0]]}g) exceeds what ${amount}g can hold; value discarded`
+        );
+    }
+
+    return { ...nutrition, [fixers[0]]: null };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1147,6 +1366,134 @@ function analyze(rawWords, mode, servingSizeDetected, fullText) {
         }
     }
 
+    // Fat / saturates labels sit on the dark part of many tables and are
+    // often unreadable while their numbers are fine. Regulated EU/UK
+    // tables always list: Energy, Fat, of which saturates, Carbohydrate.
+    // When exactly two (or one, directly above a keyed saturates row)
+    // UNLABELLED value rows sit between the kcal row and the first
+    // Carbohydrate/sugars row, they are Fat / Saturates. Every inferred
+    // value still passes column, plausibility and sat <= fat checks.
+    const inferredRows = [];
+
+    // Positional templates for the standard UK/EU order. Applied only
+    // when the number of table rows matches a template exactly AND every
+    // row whose label WAS read agrees with the template position (at
+    // least two must agree). Only unlabelled rows are filled.
+    {
+        const TEMPLATES = [
+            ["totalFat", "saturatedFat", "carbohydrates", "sugar", "fiber", "protein", "salt"],
+            ["totalFat", "saturatedFat", "carbohydrates", "sugar", "protein", "salt"],
+        ];
+
+        const isEnergy = (r) =>
+            r.kcalTokens.length > 0 ||
+            r.key === "energy" ||
+            r.tokens.some((t) => t.q && !t.q.ri && t.q.unit === "kj");
+
+        const first = rows.findIndex(isEnergy);
+
+        if (first >= 0) {
+            let start = first;
+
+            while (start + 1 < rows.length && isEnergy(rows[start + 1])) {
+                start++;
+            }
+
+            const block = [];
+            let prev = rows[start];
+
+            for (let i = start + 1; i < rows.length; i++) {
+                const r = rows[i];
+                const keyed = r.key && r.key !== "other";
+                const sentence = !keyed && r.lc.length >= 8;
+
+                if (sentence || r.yc - prev.yc > 3.2 * H) {
+                    break;
+                }
+
+                // OCR noise rows ("a", "|") carry no label and no value.
+                if (!keyed && r.values.length === 0) {
+                    continue;
+                }
+
+                block.push(r);
+                prev = r;
+            }
+
+            // Regulation (EU) 1169/2011 Annex XV fixes the order
+            // Energy -> Fat -> of which saturates -> Carbohydrate ...
+            // so the first unlabelled value row directly below the
+            // energy rows is Fat, provided later rows confirm the table
+            // (some other nutrient label was read) and no row was
+            // skipped between them.
+            if (
+                block.length > 1 &&
+                !block.some((r) => r.key === "totalFat") &&
+                !rows.some((r) => r.key === "totalFat" && r.values.length > 0) &&
+                (!block[0].key || block[0].key === "other") &&
+                block[0].yc - rows[start].yc <= 2.0 * H &&
+                block.slice(1).some((r) => r.key && r.key !== "other")
+            ) {
+                block[0].key = "totalFat";
+                block[0].inferred = true;
+                inferredRows.push("totalFat");
+            }
+
+            const template = TEMPLATES.find((t) => t.length === block.length);
+
+            if (template) {
+                const labelled = block.filter((r) => r.key && r.key !== "other" && !r.inferred);
+                const agree = labelled.filter((r) => r.key === template[block.indexOf(r)]);
+
+                if (labelled.length >= 2 && agree.length === labelled.length) {
+                    block.forEach((r, i) => {
+                        if (!r.key || r.key === "other" || r.inferred) {
+                            r.key = template[i];
+                            r.inferred = true;
+                            inferredRows.push(template[i]);
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    {
+        const kcalIdx = rows.findIndex((r) => r.kcalTokens.length > 0);
+        const carbIdx = rows.findIndex(
+            (r, i) => i > kcalIdx && r.key === "carbohydrates" && r.values.length > 0
+        );
+
+        if (kcalIdx >= 0 && carbIdx > kcalIdx) {
+            const between = [];
+
+            for (let i = kcalIdx + 1; i < carbIdx; i++) {
+                const r = rows[i];
+
+                if (r.values.length > 0 && (!r.key || r.key === "other")) {
+                    between.push(r);
+                }
+            }
+
+            const hasFat = rows.some((r) => r.key === "totalFat" && r.values.length > 0);
+            const satRow = rows.find(
+                (r, i) => i > kcalIdx && i < carbIdx && r.key === "saturatedFat" && r.values.length > 0
+            );
+
+            if (between.length === 2 && !hasFat && !satRow) {
+                between[0].key = "totalFat";
+                between[1].key = "saturatedFat";
+                inferredRows.push("totalFat", "saturatedFat");
+            } else if (between.length === 1 && !hasFat && satRow && rows.indexOf(between[0]) < rows.indexOf(satRow)) {
+                between[0].key = "totalFat";
+                inferredRows.push("totalFat");
+            } else if (between.length === 1 && hasFat && !satRow && rows.indexOf(between[0]) > rows.findIndex((r) => r.key === "totalFat")) {
+                between[0].key = "saturatedFat";
+                inferredRows.push("saturatedFat");
+            }
+        }
+    }
+
     let dataStart = rows.findIndex(
         (r) => (r.key && r.key !== "other") || r.kcalTokens.length > 0
     );
@@ -1184,6 +1531,7 @@ function analyze(rawWords, mode, servingSizeDetected, fullText) {
             })),
             selected: null,
             matchedRows,
+            inferredRows,
             rejected,
             warnings,
             detectedColumns: columns.map((c) => ({
@@ -1242,6 +1590,9 @@ function analyze(rawWords, mode, servingSizeDetected, fullText) {
         return { amount: null, unit: null };
     });
 
+    const metadata_repaired = [];
+    const columnValues = {};
+
     for (const key of NUTRIENT_KEYS) {
         let row = null;
         let tokens = [];
@@ -1290,6 +1641,8 @@ function analyze(rawWords, mode, servingSizeDetected, fullText) {
 
             return v;
         });
+
+        columnValues[key] = values;
 
         let target = values[selIndex] ?? null;
 
@@ -1353,10 +1706,69 @@ function analyze(rawWords, mode, servingSizeDetected, fullText) {
             }
         }
 
+        // Decimal point lost to OCR ("34g", "006g", "50g"): resolve it
+        // against the per-100 neighbour of the same row, never alone.
+        if (target === null && GRAM_KEYS.includes(key) && assigned[selIndex]) {
+            const sel = columnAmount[selIndex];
+            const refIdx = columns.findIndex(
+                (c, i) =>
+                    i !== selIndex &&
+                    c.kind === "amount" &&
+                    c.amount === 100 &&
+                    c.unit === sel.unit
+            );
+
+            if (refIdx >= 0 && assigned[refIdx] && sel.amount && sel.unit === "g") {
+                const ratio = sel.amount / 100;
+
+                // A sub-nutrient can never exceed its parent: saturates
+                // <= fat, sugars <= carbohydrate. This stops "50g | 16"
+                // (impossible) beating "5.0g | 1.6" when the decimal
+                // point was lost. Parent bounds come from the same
+                // columns when they were read.
+                const parentKey = { saturatedFat: "totalFat", sugar: "carbohydrates" }[key];
+                let maxTarget = 100 * ratio + 0.5;
+                let maxRef = 100;
+
+                if (parentKey) {
+                    const parentRef = columnValues[parentKey]?.[refIdx];
+                    const parentTarget = result.nutrition[parentKey];
+
+                    if (parentRef !== null && parentRef !== undefined) {
+                        maxRef = Math.min(maxRef, parentRef);
+                    }
+
+                    if (parentTarget !== null && parentTarget !== undefined) {
+                        maxTarget = Math.min(maxTarget, parentTarget);
+                    }
+                }
+
+                const fixed = repairWithReference(
+                    assigned[selIndex],
+                    assigned[refIdx],
+                    ratio,
+                    maxTarget,
+                    maxRef
+                );
+
+                if (fixed !== null) {
+                    target = fixed;
+                    metadata_repaired.push(key);
+                }
+            }
+        }
+
         result.nutrition[key] = target;
     }
 
-    result.nutrition = validateNutrition(result.nutrition);
+    result.metadata.repairedDecimals = metadata_repaired;
+
+    result.nutrition = enforceMassBudget(
+        validateNutrition(result.nutrition),
+        selection.amount,
+        selection.unit,
+        warnings
+    );
 
     return result;
 }
@@ -1371,9 +1783,21 @@ function countFilled(result) {
     ).length;
 }
 
-function parseNutrition(text, words) {
+function parseNutrition(text, words, servingHint) {
     const normalizedText = normalizeText(text);
-    const servingSize = detectServingSize(normalizedText);
+    let servingSize = detectServingSize(normalizedText);
+
+    // A cropped table has no "Portion size: 32g" line of its own; the
+    // serving size printed elsewhere on the pack (other OCR passes) is
+    // used so corrupted headers such as "132g" resolve to "/32g".
+    if (
+        servingSize.value === null &&
+        servingHint &&
+        servingHint.value !== null &&
+        servingHint.value !== undefined
+    ) {
+        servingSize = { value: servingHint.value, unit: servingHint.unit };
+    }
 
     const coordWords = prepareWords(words);
 
@@ -1424,9 +1848,20 @@ function sameServing(a, b) {
  * - A tie (e.g. two passes disagree) -> null. Never guess.
  */
 function parseNutritionMultiPass(passes) {
+    let servingHint = null;
+
+    for (const p of passes || []) {
+        const found = detectServingSize(normalizeText(p.text));
+
+        if (found.value !== null) {
+            servingHint = found;
+            break;
+        }
+    }
+
     const results = (passes || []).map((p) => ({
         name: p.name || "pass",
-        result: parseNutrition(p.text, p.words),
+        result: parseNutrition(p.text, p.words, servingHint),
     }));
 
     if (!results.length) {
@@ -1435,12 +1870,20 @@ function parseNutritionMultiPass(passes) {
 
     const primary = results
         .slice()
-        .sort(
-            (a, b) =>
+        .sort((a, b) => {
+            const servingPrinted = results.some(
+                (r) => r.result.servingSize && r.result.servingSize.value !== null
+            );
+            const isServing = (r) =>
+                r.result.nutritionBasis === "per-serving" ? 1 : 0;
+
+            return (
                 (b.result.nutritionBasis ? 1 : 0) -
                     (a.result.nutritionBasis ? 1 : 0) ||
+                (servingPrinted ? isServing(b) - isServing(a) : 0) ||
                 countFilled(b.result) - countFilled(a.result)
-        )[0];
+            );
+        })[0];
 
     const compatible = results.filter(
         (r) =>
@@ -1494,8 +1937,34 @@ function parseNutritionMultiPass(passes) {
 
     merged.nutrition = validateNutrition(merged.nutrition);
 
+    {
+        const amount =
+            merged.nutritionBasis === "per-serving"
+                ? merged.servingSize && merged.servingSize.value
+                : merged.nutritionBasis === "per-100g"
+                ? 100
+                : null;
+        const unit =
+            merged.nutritionBasis === "per-serving"
+                ? merged.servingSize && merged.servingSize.unit
+                : merged.nutritionBasis === "per-100g"
+                ? "g"
+                : null;
+        const budgetWarnings = [];
+
+        merged.nutrition = validateNutrition(
+            enforceMassBudget(merged.nutrition, amount, unit, budgetWarnings)
+        );
+
+        merged.budgetWarnings = budgetWarnings;
+    }
+
     merged.metadata = {
         ...primary.result.metadata,
+        warnings: [
+            ...((primary.result.metadata && primary.result.metadata.warnings) || []),
+            ...(merged.budgetWarnings || []),
+        ],
         primaryPass: primary.name,
         comparedPasses: compatible.map((r) => r.name),
         votes,
@@ -1507,6 +1976,8 @@ function parseNutritionMultiPass(passes) {
             filled: countFilled(r.result),
         })),
     };
+
+    delete merged.budgetWarnings;
 
     return merged;
 }

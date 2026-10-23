@@ -18,9 +18,12 @@ const { getIngredientEvidence } = require("../rag/rag.service");
  *   ]
  * }
  *
- * The OCR service already provides multi-pass OCR and word-level
- * coordinates. We preserve that information because the deterministic
- * nutrition parser depends on it.
+ * The OCR service provides multiple OCR passes and word-level
+ * coordinates. We preserve all of that information because:
+ *
+ * 1. The deterministic nutrition parser needs coordinates.
+ * 2. Product extraction benefits from seeing multiple OCR passes.
+ * 3. Allergen extraction needs evidence from all available OCR.
  */
 function normalizeOcrOutput(ocrOutput) {
     if (typeof ocrOutput === "string") {
@@ -52,8 +55,10 @@ function normalizeOcrOutput(ocrOutput) {
 
             passes.push({
                 name:
-                    pass.name ||
-                    `pass-${passes.length + 1}`,
+                    typeof pass.name === "string" &&
+                    pass.name.trim()
+                        ? pass.name
+                        : `pass-${passes.length + 1}`,
 
                 text: pass.text,
 
@@ -67,8 +72,16 @@ function normalizeOcrOutput(ocrOutput) {
     /*
      * Backward compatibility:
      *
-     * If the OCR service returns a single words array but no
-     * multi-pass structure, preserve it as one OCR pass.
+     * Some older OCR implementations may return:
+     *
+     * {
+     *   text: "...",
+     *   words: [...]
+     * }
+     *
+     * but no passes array.
+     *
+     * Preserve that information as one OCR pass.
      */
     if (
         !passes.length &&
@@ -81,6 +94,10 @@ function normalizeOcrOutput(ocrOutput) {
         });
     }
 
+    /*
+     * If the top-level OCR text is empty but passes exist,
+     * use the first pass as the primary OCR text.
+     */
     if (!text.trim() && passes.length) {
         text = passes[0].text;
     }
@@ -92,6 +109,54 @@ function normalizeOcrOutput(ocrOutput) {
 }
 
 /**
+ * Build a combined OCR text string from every OCR pass.
+ *
+ * This is important for Step 2.
+ *
+ * Example:
+ *
+ * Pass 1:
+ *   Emulsifier Lecithin
+ *
+ * Pass 2:
+ *   Emulsifier [Soya Lecithin]
+ *
+ * The extraction service should see BOTH.
+ *
+ * We deliberately do not remove duplicate text here.
+ * Different OCR passes may contain slightly different
+ * evidence and the extraction service can decide what
+ * information is reliable.
+ */
+function buildAdditionalOcrText(passes) {
+    if (!Array.isArray(passes) || !passes.length) {
+        return "";
+    }
+
+    return passes
+        .map((pass, index) => {
+            const name =
+                typeof pass.name === "string" &&
+                pass.name.trim()
+                    ? pass.name.trim()
+                    : `pass-${index + 1}`;
+
+            const text =
+                typeof pass.text === "string"
+                    ? pass.text.trim()
+                    : "";
+
+            if (!text) {
+                return "";
+            }
+
+            return `--- OCR PASS: ${name} ---\n${text}`;
+        })
+        .filter(Boolean)
+        .join("\n\n");
+}
+
+/**
  * Main Node.js AI pipeline.
  *
  * Flow:
@@ -100,7 +165,7 @@ function normalizeOcrOutput(ocrOutput) {
  *     ↓
  * Multi-pass OCR
  *     ↓
- * Product / Ingredient Extraction using Groq
+ * Product / Ingredient Extraction
  *     ↓
  * RAG ingredient evidence
  *     ↓
@@ -108,8 +173,8 @@ function normalizeOcrOutput(ocrOutput) {
  *
  * Important:
  *
- * - OCR is responsible for extracting text and coordinates.
- * - Product extraction uses OCR text.
+ * - OCR extracts text and coordinates.
+ * - Product extraction uses all useful OCR evidence.
  * - Nutrition parsing is performed later by scan.service.js.
  * - Deterministic health rules remain outside this pipeline.
  * - AI does NOT determine the health score or grade.
@@ -123,19 +188,12 @@ async function analyzeImage(imageBuffer) {
     // 1. MULTI-PASS OCR
     // --------------------------------------------------
     //
-    // IMPORTANT:
+    // Do NOT replace this with a simple OCR text function.
     //
-    // Do NOT use extractText() here.
-    //
-    // extractText() intentionally performs only one OCR pass
-    // and returns plain text.
-    //
-    // The nutrition parser needs:
+    // scan.service.js needs:
     // - multiple OCR passes
     // - word coordinates
     // - bounding boxes
-    //
-    // Therefore we use extractOCR() directly.
     //
     const rawOcr = await extractOCR(imageBuffer, {
         multiPass: true,
@@ -150,28 +208,60 @@ async function analyzeImage(imageBuffer) {
     }
 
     // --------------------------------------------------
-    // 2. PRODUCT / INGREDIENT EXTRACTION
+    // 2. BUILD COMPLETE OCR EVIDENCE
     // --------------------------------------------------
     //
-    // Groq receives the combined/primary OCR text.
+    // Previously only the primary OCR text was sent to
+    // extractProductInfo().
     //
-    // It is used for:
+    // That caused a real information-loss problem:
+    //
+    // OCR PASS 1:
+    //   Emulsifier Lecithin
+    //
+    // OCR PASS 2:
+    //   Emulsifier [Soya Lecithin]
+    //
+    // If only PASS 1 was sent to Groq, the model had no
+    // reliable evidence for "soya".
+    //
+    // We now preserve the primary OCR text separately and
+    // send all additional passes as additional evidence.
+    //
+    const additionalOcrText =
+        buildAdditionalOcrText(ocr.passes);
+
+    // --------------------------------------------------
+    // 3. PRODUCT / INGREDIENT EXTRACTION
+    // --------------------------------------------------
+    //
+    // Groq is used for structured extraction.
+    //
+    // It can extract:
     // - product name
     // - brand
+    // - variant
+    // - pack information
     // - serving information
     // - ingredients
-    // - nutrition fallback
+    // - allergen evidence
     //
-    // It does NOT determine the final health score.
+    // Nutrition parsing is still handled deterministically
+    // by scan.service.js.
     //
-    const product = await extractProductInfo(ocrText);
+    // Groq must NOT determine the final health score.
+    //
+    const product = await extractProductInfo(
+        ocrText,
+        additionalOcrText
+    );
 
     if (!product || typeof product !== "object") {
         throw new Error("Product extraction failed");
     }
 
     // --------------------------------------------------
-    // 3. RAG INGREDIENT EVIDENCE
+    // 4. RAG INGREDIENT EVIDENCE
     // --------------------------------------------------
     //
     // RAG is used only for ingredient evidence.
@@ -206,17 +296,16 @@ async function analyzeImage(imageBuffer) {
     }
 
     // --------------------------------------------------
-    // 4. FINAL PIPELINE RESULT
+    // 5. FINAL PIPELINE RESULT
     // --------------------------------------------------
     //
-    // ocrPasses is intentionally preserved.
+    // Keep ALL OCR passes.
     //
     // scan.service.js consumes this data through:
     //
     // parseNutritionMultiPass(ocrPasses)
     //
-    // This allows the deterministic nutrition parser to use
-    // coordinates and multiple OCR passes.
+    // Therefore we must not simplify the OCR result here.
     //
     return {
         ocr: {

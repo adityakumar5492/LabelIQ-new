@@ -1491,7 +1491,22 @@ function IngredientKnowledgeCard({
 ========================================================= */
 
 function AllergensCard({ allergens }) {
-  if (!allergens || allergens.length === 0) {
+  const confirmed = Array.isArray(
+    allergens?.confirmed
+  )
+    ? allergens.confirmed
+    : [];
+
+  const mayContain = Array.isArray(
+    allergens?.may_contain
+  )
+    ? allergens.may_contain
+    : [];
+
+  const hasConfirmed = confirmed.length > 0;
+  const hasMayContain = mayContain.length > 0;
+
+  if (!hasConfirmed && !hasMayContain) {
     return (
       <GlassCard className="p-5 sm:p-6">
         <SectionHeader
@@ -1511,19 +1526,70 @@ function AllergensCard({ allergens }) {
         icon={ShieldAlert}
         eyebrow="Allergens"
         title="Potential allergens"
-        description="Allergens identified or declared in the analyzed label."
+        description="Confirmed allergens are separated from may-contain warnings found on the label."
       />
 
-      <div className="flex flex-wrap gap-2">
-        {allergens.map((allergen, index) => (
-          <span
-            key={`${allergen}-${index}`}
-            className="rounded-lg border border-amber-400/20 bg-amber-400/[0.07] px-3 py-2 text-sm text-amber-200"
-          >
-            {allergen}
-          </span>
-        ))}
-      </div>
+      {hasConfirmed && (
+        <div>
+          <div className="mb-3 flex items-center gap-2">
+            <CheckCircle2
+              size={15}
+              className="text-emerald-300"
+            />
+
+            <h4 className="text-sm font-semibold text-white">
+              Confirmed
+            </h4>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            {confirmed.map((allergen, index) => (
+              <span
+                key={`confirmed-${allergen}-${index}`}
+                className="rounded-lg border border-red-400/20 bg-red-400/[0.07] px-3 py-2 text-sm text-red-200"
+              >
+                {allergen}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {hasMayContain && (
+        <div
+          className={
+            hasConfirmed ? "mt-5" : ""
+          }
+        >
+          <div className="mb-3 flex items-center gap-2">
+            <AlertTriangle
+              size={15}
+              className="text-amber-300"
+            />
+
+            <h4 className="text-sm font-semibold text-white">
+              May contain
+            </h4>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            {mayContain.map((allergen, index) => (
+              <span
+                key={`may-contain-${allergen}-${index}`}
+                className="rounded-lg border border-amber-400/20 bg-amber-400/[0.07] px-3 py-2 text-sm text-amber-200"
+              >
+                {allergen}
+              </span>
+            ))}
+          </div>
+
+          <p className="mt-3 text-xs leading-5 text-slate-500">
+            "May contain" indicates possible
+            cross-contact and does not mean the
+            allergen was confirmed as an ingredient.
+          </p>
+        </div>
+      )}
     </GlassCard>
   );
 }
@@ -1987,9 +2053,21 @@ export default function ScanResult() {
     aiInsights
   );
 
-  const allergens = asArray(
-    aiAnalysis.allergens
-  );
+  const allergens = isPlainObject(
+  aiAnalysis.allergens
+)
+  ? {
+      confirmed: asArray(
+        aiAnalysis.allergens.confirmed
+      ),
+      may_contain: asArray(
+        aiAnalysis.allergens.may_contain
+      ),
+    }
+  : {
+      confirmed: [],
+      may_contain: [],
+    };
 
   const ruleMatches = asArray(
     analysis.ruleMatches

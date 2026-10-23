@@ -87,7 +87,7 @@ const normalizePackSize = (packSize) => {
 };
 
 // ============================================
-// NUTRITION / INGREDIENT NORMALIZATION (Group 2)
+// NUTRITION / INGREDIENT NORMALIZATION
 // ============================================
 
 const NUTRITION_KEYS = [
@@ -109,8 +109,6 @@ const ALLOWED_BASES = new Set([
     "per-piece",
 ]);
 
-// Maps wording variants to the four bases the system understands.
-// Anything else becomes null. Nothing is guessed.
 const normalizeNutritionBasis = (value) => {
     if (typeof value !== "string") {
         return null;
@@ -145,11 +143,12 @@ const normalizeServingSize = (servingSize) => {
         return { value: null, unit: null };
     }
 
-    return { value, unit: unit.toLowerCase() };
+    return {
+        value,
+        unit: unit.toLowerCase(),
+    };
 };
 
-// Every key is always present. Missing / invalid stays null,
-// a real 0 stays 0.
 const normalizeNutrition = (nutrition) => {
     const source =
         nutrition &&
@@ -167,7 +166,8 @@ const normalizeNutrition = (nutrition) => {
     return result;
 };
 
-// Keeps the label's original order. Strings only.
+// Keeps the label's original order.
+// Strings only.
 const normalizeIngredients = (ingredients) => {
     if (!Array.isArray(ingredients)) {
         return [];
@@ -187,7 +187,9 @@ const normalizeIngredients = (ingredients) => {
             continue;
         }
 
-        const name = cleanString(rawName.trim().replace(/[.;,]+$/, ""));
+        const name = cleanString(
+            rawName.trim().replace(/[.;,]+$/, "")
+        );
 
         if (name) {
             result.push(name);
@@ -207,30 +209,297 @@ const normalizeUncertainFields = (fields) => {
         .filter(Boolean);
 };
 
-// Product identity / pack fields (Group 1) and nutrition /
-// ingredient fields (Group 2) are all normalized here so the
-// rest of the pipeline receives a predictable shape.
-const normalizeExtraction = (parsed) => {
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new Error("Groq extraction response was not a JSON object");
+// ============================================
+// ALLERGEN NORMALIZATION / DETECTION
+// ============================================
+
+const ALLERGEN_ALIASES = {
+    peanuts: ["peanut", "peanuts"],
+
+    milk: [
+        "milk",
+        "skimmed milk",
+        "whey",
+        "lactose",
+        "milk fat",
+        "milk powder",
+    ],
+
+    soya: [
+        "soya",
+        "soy",
+        "soybean",
+    ],
+
+    nuts: [
+        "nuts",
+        "almond",
+        "almonds",
+        "hazelnut",
+        "hazelnuts",
+        "walnut",
+        "walnuts",
+        "cashew",
+        "cashews",
+        "pistachio",
+        "pistachios",
+        "pecan",
+        "pecans",
+    ],
+
+    wheat: ["wheat"],
+
+    barley: ["barley"],
+
+    oats: [
+        "oat",
+        "oats",
+    ],
+
+    sesame: ["sesame"],
+
+    egg: [
+        "egg",
+        "eggs",
+    ],
+
+    fish: ["fish"],
+
+    crustaceans: [
+        "crustacean",
+        "crustaceans",
+        "shrimp",
+        "prawn",
+        "prawns",
+    ],
+
+    celery: ["celery"],
+
+    mustard: ["mustard"],
+
+    sulphites: [
+        "sulphite",
+        "sulphites",
+        "sulfite",
+        "sulfites",
+    ],
+
+    lupin: [
+        "lupin",
+        "lupine",
+    ],
+
+    molluscs: [
+        "mollusc",
+        "molluscs",
+        "mussel",
+        "mussels",
+        "clam",
+        "clams",
+    ],
+};
+
+const uniqueStrings = (values) =>
+    [
+        ...new Set(
+            values
+                .filter(Boolean)
+                .map((value) => String(value).trim())
+        ),
+    ];
+
+const containsAlias = (text, alias) => {
+    const escaped = alias.replace(
+        /[.*+?^${}()|[\]\\]/g,
+        "\\$&"
+    );
+
+    return new RegExp(
+        `\\b${escaped.replace(/\\s+/g, "\\s+")}\\b`,
+        "i"
+    ).test(text);
+};
+
+// Deterministic evidence check.
+//
+// It never invents an allergen.
+// A canonical allergen is returned only when an alias
+// is actually present in OCR text.
+//
+// "may contain" lines are kept separate from confirmed evidence.
+const detectAllergensFromOcr = (ocrText) => {
+    const text = String(ocrText || "");
+
+    const lines = text
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+    const confirmed = [];
+    const mayContain = [];
+
+    for (const [canonical, aliases] of Object.entries(
+        ALLERGEN_ALIASES
+    )) {
+        const mayLines = lines.filter((line) =>
+            /may\s+contain|traces?\s+of|manufactured\s+in/i.test(
+                line
+            )
+        );
+
+        const confirmedText = lines
+            .filter(
+                (line) =>
+                    !/may\s+contain|traces?\s+of/i.test(line)
+            )
+            .join(" ");
+
+        const mayText = mayLines.join(" ");
+
+        const inMay = aliases.some((alias) =>
+            containsAlias(mayText, alias)
+        );
+
+        const inConfirmed = aliases.some((alias) =>
+            containsAlias(confirmedText, alias)
+        );
+
+        if (inMay) {
+            mayContain.push(canonical);
+        }
+
+        if (inConfirmed && !inMay) {
+            confirmed.push(canonical);
+        }
+    }
+
+    return {
+        confirmed: uniqueStrings(confirmed),
+        may_contain: uniqueStrings(mayContain),
+    };
+};
+
+const normalizeAllergens = (value, ocrText = "") => {
+    const detected = detectAllergensFromOcr(ocrText);
+
+    const source =
+        value &&
+        typeof value === "object" &&
+        !Array.isArray(value)
+            ? value
+            : {};
+
+    const cleanList = (items) =>
+        Array.isArray(items)
+            ? uniqueStrings(
+                  items
+                      .map((item) => cleanString(item, 80))
+                      .filter(Boolean)
+              )
+            : [];
+
+    const modelConfirmed = cleanList(source.confirmed);
+
+    const modelMayContain = cleanList(
+        source.may_contain || source.mayContain
+    );
+
+    // Model output is accepted only when the same canonical
+    // allergen has textual OCR evidence.
+    //
+    // Deterministic OCR evidence is always retained.
+    const evidenceText = String(ocrText || "");
+
+    const evidenceFor = (name) => {
+        const aliases =
+            ALLERGEN_ALIASES[name] || [name];
+
+        return aliases.some((alias) =>
+            containsAlias(evidenceText, alias)
+        );
+    };
+
+    const confirmed = uniqueStrings([
+        ...detected.confirmed,
+        ...modelConfirmed.filter(evidenceFor),
+    ]);
+
+    const may_contain = uniqueStrings([
+        ...detected.may_contain,
+        ...modelMayContain.filter(evidenceFor),
+    ]).filter(
+        (name) => !confirmed.includes(name)
+    );
+
+    return {
+        confirmed,
+        may_contain,
+    };
+};
+
+// ============================================
+// COMPLETE EXTRACTION NORMALIZATION
+// ============================================
+
+const normalizeExtraction = (
+    parsed,
+    ocrText = ""
+) => {
+    if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed)
+    ) {
+        throw new Error(
+            "Groq extraction response was not a JSON object"
+        );
     }
 
     return {
         ...parsed,
+
         name: cleanString(parsed.name),
+
         brand: cleanString(parsed.brand),
+
         variant: cleanString(parsed.variant),
-        packSize: normalizePackSize(parsed.packSize),
-        servingsPerContainer: toPositiveNumberOrNull(
-            parsed.servingsPerContainer
+
+        allergens: normalizeAllergens(
+            parsed.allergens,
+            ocrText
         ),
 
-        // Group 2
-        servingSize: normalizeServingSize(parsed.servingSize),
-        nutritionBasis: normalizeNutritionBasis(parsed.nutritionBasis),
-        nutrition: normalizeNutrition(parsed.nutrition),
-        ingredients: normalizeIngredients(parsed.ingredients),
-        uncertainFields: normalizeUncertainFields(parsed.uncertainFields),
+        packSize: normalizePackSize(
+            parsed.packSize
+        ),
+
+        servingsPerContainer:
+            toPositiveNumberOrNull(
+                parsed.servingsPerContainer
+            ),
+
+        servingSize: normalizeServingSize(
+            parsed.servingSize
+        ),
+
+        nutritionBasis:
+            normalizeNutritionBasis(
+                parsed.nutritionBasis
+            ),
+
+        nutrition: normalizeNutrition(
+            parsed.nutrition
+        ),
+
+        ingredients:
+            normalizeIngredients(
+                parsed.ingredients
+            ),
+
+        uncertainFields:
+            normalizeUncertainFields(
+                parsed.uncertainFields
+            ),
     };
 };
 
@@ -243,7 +512,14 @@ const stripJsonFences = (content) => {
         .trim();
 };
 
-async function extractProductInfo(ocrText) {
+// ============================================
+// GROQ EXTRACTION
+// ============================================
+
+async function extractProductInfo(
+    ocrText,
+    additionalOcrText = ""
+) {
     if (!ocrText || !ocrText.trim()) {
         throw new Error("OCR text is required");
     }
@@ -291,35 +567,79 @@ GENERAL RULES:
 
 PRODUCT IDENTITY vs PACK INFORMATION:
 
-Product identity fields are: name, brand, variant.
-Pack information fields are: packSize, servingSize, servingsPerContainer.
+Product identity fields are:
+name, brand, variant.
+
+Pack information fields are:
+packSize, servingSize, servingsPerContainer.
+
 Never mix these two groups.
 
 name:
-The product's own name exactly as printed on the pack (for example "Choco Crunch Cereal").
+The product's own name exactly as printed on the pack.
+
+For example:
+"Choco Crunch Cereal"
+
 Return null if the product name is not clearly printed in the OCR text.
-Do NOT use the brand alone, a slogan, a marketing claim, the manufacturer address, an ingredient, or a nutrition heading as the product name.
-Do NOT infer a product name from the ingredients or the product category.
+
+Do NOT use:
+- the brand alone
+- a slogan
+- a marketing claim
+- manufacturer address
+- an ingredient
+- a nutrition heading
+
+as the product name.
+
+Do NOT infer a product name from ingredients or product category.
 
 brand:
-The brand or manufacturer name only when it is explicitly printed. Otherwise null.
+The brand or manufacturer name only when explicitly printed.
+Otherwise null.
 
 variant:
-The flavour or variety only when it is explicitly printed (for example "Chocolate", "Salted", "Sugar Free"). Otherwise null.
+The flavour or variety only when explicitly printed.
+
+Examples:
+- Chocolate
+- Salted
+- Sugar Free
+
+Otherwise null.
 
 packSize:
-The total net content of the package, only when explicitly printed, for example:
-Net Wt 200g, Net Weight 1kg, Net Content 500ml, Net Qty 6 pieces, 6 x 30g.
-- value: the number (for example 200)
-- unit: the unit exactly as printed in simple form (for example "g", "kg", "ml", "l", "pieces")
-- raw: the exact printed text (for example "Net Wt 200g" or "6 x 30g")
-For multipacks such as "6 x 30g" set raw to the printed text and set value and unit to null.
-packSize is NOT the serving size. Never copy the serving size into packSize.
+The total net content of the package, only when explicitly printed.
+
+Examples:
+- Net Wt 200g
+- Net Weight 1kg
+- Net Content 500ml
+- Net Qty 6 pieces
+- 6 x 30g
+
+For multipacks such as "6 x 30g":
+set raw to the printed text
+and set value and unit to null.
+
+packSize is NOT the serving size.
+
+Never copy the serving size into packSize.
+
 Return value, unit and raw as null if no pack size is printed.
 
 servingsPerContainer:
-The number of servings in the pack, only when explicitly printed (for example "Servings per container: 8" or "About 8 servings").
-Return the number only. Do not calculate it from packSize and servingSize.
+The number of servings in the pack, only when explicitly printed.
+
+Examples:
+- Servings per container: 8
+- About 8 servings
+
+Return the number only.
+
+Do not calculate it from packSize and servingSize.
+
 Return null if it is not printed.
 
 NUTRITION BASIS EXAMPLES:
@@ -371,7 +691,9 @@ nutritionBasis = "per-serving"
 
 SERVING SIZE:
 
-Extract an explicitly stated serving/portion size such as:
+Extract an explicitly stated serving/portion size.
+
+Examples:
 
 Serving size: 32g
 Portion size: 40ml
@@ -385,6 +707,46 @@ Extract the ingredient list in the original order.
 
 Do not merge unrelated ingredients.
 
+Preserve nested ingredient declarations such as:
+- parentheses
+- [from ...]
+- nested ingredient groups
+
+Only normalize obvious OCR spacing.
+
+Do not invent missing words.
+
+ALLERGENS:
+
+Identify allergens only when the OCR provides textual evidence.
+
+Use both:
+1. ingredient text
+2. explicit allergen / contains statements
+3. may-contain / traces statements
+4. additional OCR passes
+
+Keep confirmed allergens separate from may-contain allergens.
+
+Never turn a may-contain allergen into a confirmed allergen.
+
+Do not infer soya from the word "lecithin" alone.
+
+Require supporting OCR evidence such as:
+- soya
+- soy
+- soybean
+- soya lecithin
+
+Return canonical names such as:
+- peanuts
+- milk
+- soya
+- nuts
+- wheat
+- barley
+- oats
+
 Return ONLY valid JSON.
 
 Use exactly this structure:
@@ -394,6 +756,11 @@ Use exactly this structure:
   "brand": null,
   "variant": null,
   "category": null,
+
+  "allergens": {
+    "confirmed": [],
+    "may_contain": []
+  },
 
   "packSize": {
     "value": null,
@@ -429,6 +796,16 @@ Use exactly this structure:
   "uncertainFields": []
 }
 
+IMPORTANT ALLERGEN FIELD RULES:
+
+allergens.confirmed:
+Allergens supported by ingredient text or an explicit contains/allergen statement.
+
+allergens.may_contain:
+Allergens supported only by a may-contain / traces-of style statement.
+
+Do not place the same allergen in both arrays.
+
 IMPORTANT NUTRITION FIELD RULES:
 
 calories:
@@ -454,11 +831,16 @@ Extract fibre/fiber only when explicitly present.
 
 sodium:
 Extract sodium ONLY when the label explicitly provides sodium.
-If the label provides only salt, return sodium as null.
+
+If the label provides only salt:
+return sodium as null.
 
 salt:
-Extract salt (in grams) ONLY when the label explicitly provides salt.
-Do NOT convert salt to sodium and do NOT convert sodium to salt.
+Extract salt in grams ONLY when the label explicitly provides salt.
+
+Do NOT convert salt to sodium.
+
+Do NOT convert sodium to salt.
 
 Do not confuse:
 - salt with sodium
@@ -469,45 +851,69 @@ Do not confuse:
 OCR TEXT:
 
 ${ocrText}
+
+ADDITIONAL OCR PASSES / VIEWS:
+
+${additionalOcrText}
 `;
 
-    const completion = await groq.chat.completions.create({
-        model: "openai/gpt-oss-20b",
-        temperature: 0,
-        max_completion_tokens: 4096,
-        reasoning_effort: "low",
-        messages: [
-            {
-                role: "user",
-                content: prompt,
-            },
-        ],
-    });
+    const completion =
+        await groq.chat.completions.create({
+            model: "openai/gpt-oss-20b",
 
-    const content = completion.choices?.[0]?.message?.content;
+            temperature: 0,
+
+            max_completion_tokens: 4096,
+
+            reasoning_effort: "low",
+
+            messages: [
+                {
+                    role: "user",
+                    content: prompt,
+                },
+            ],
+        });
+
+    const content =
+        completion.choices?.[0]?.message?.content;
 
     if (!content) {
         console.log(
             "FULL GROQ RESPONSE:",
-            JSON.stringify(completion, null, 2)
+            JSON.stringify(
+                completion,
+                null,
+                2
+            )
         );
 
-        throw new Error("Groq returned an empty response");
+        throw new Error(
+            "Groq returned an empty response"
+        );
     }
 
     let parsed;
 
     try {
-        parsed = JSON.parse(stripJsonFences(content));
+        parsed = JSON.parse(
+            stripJsonFences(content)
+        );
     } catch (error) {
-        console.error("Groq raw content:", content);
+        console.error(
+            "Groq raw content:",
+            content
+        );
 
         throw new Error(
             "Failed to parse Groq extraction response"
         );
     }
 
-    return normalizeExtraction(parsed);
+    return normalizeExtraction(
+        parsed,
+        `${ocrText}\n${additionalOcrText}`
+    );
 }
 
 module.exports = {
