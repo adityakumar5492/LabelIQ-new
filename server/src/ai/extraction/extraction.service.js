@@ -22,10 +22,118 @@ const getGroqClient = () => {
 
         groqClient = new Groq({
             apiKey: process.env.GROQ_API_KEY,
+            // The SDK default is 60 s and 2 automatic retries (up to ~3 min
+            // for ONE call, longer than the browser waits). Every request
+            // below sets its own timeout; retries are handled explicitly.
+            maxRetries: 0,
+            timeout: EXTRACTION_TIMEOUT_MS,
         });
     }
 
     return groqClient;
+};
+
+// ---- Groq extraction: bounded time, at most ONE retry ----
+//
+// Retried only for failures that are likely to be transient and are not
+// caused by the request itself: timeouts, dropped connections, 5xx.
+// Never retried: 429 (retrying makes rate limiting worse), 4xx (the same
+// request fails again, e.g. 413 request too large) and cancelled scans.
+// Worst case: 2 x timeout.
+const EXTRACTION_TIMEOUT_MS =
+    Number.parseInt(process.env.GROQ_EXTRACTION_TIMEOUT_MS, 10) || 30000;
+const EXTRACTION_MAX_ATTEMPTS = 2;
+
+const isTransientGroqError = (error) => {
+    const status = error?.status;
+
+    if (status === undefined || status === null) {
+        // timeout / connection error (no HTTP status)
+        return true;
+    }
+
+    return status >= 500;
+};
+
+const extractionFailure = (error) => {
+    const status = error?.status;
+    let message =
+        "Ingredient extraction is temporarily unavailable. Please try again in a moment.";
+
+    if (status === 429) {
+        message =
+            "The AI service is busy right now (rate limit). Please try again in a few seconds.";
+    } else if (status === 413) {
+        message = "The label text was too large for the AI service.";
+    }
+
+    const failure = new Error(message);
+
+    failure.cause = error;
+    failure.statusCode = status === 429 ? 429 : 503;
+
+    return failure;
+};
+
+const createExtractionCompletion = async (body, { signal, log } = {}) => {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= EXTRACTION_MAX_ATTEMPTS; attempt++) {
+        if (signal && signal.aborted) {
+            const aborted = new Error("Scan cancelled: client disconnected");
+
+            aborted.code = "SCAN_ABORTED";
+
+            throw aborted;
+        }
+
+        const t0 = Date.now();
+
+        try {
+            const completion = await getGroqClient().chat.completions.create(
+                body,
+                {
+                    timeout: EXTRACTION_TIMEOUT_MS,
+                    maxRetries: 0,
+                    ...(signal ? { signal } : {}),
+                }
+            );
+
+            if (typeof log === "function") {
+                const usage = completion?.usage || {};
+
+                log(
+                    `Groq extraction attempt ${attempt}: ${Date.now() - t0} ms, ` +
+                        `prompt_tokens=${usage.prompt_tokens ?? "?"}, ` +
+                        `completion_tokens=${usage.completion_tokens ?? "?"}`
+                );
+            }
+
+            return completion;
+        } catch (error) {
+            lastError = error;
+
+            if (signal && signal.aborted) {
+                const aborted = new Error("Scan cancelled: client disconnected");
+
+                aborted.code = "SCAN_ABORTED";
+
+                throw aborted;
+            }
+
+            console.error(
+                `Groq extraction attempt ${attempt}/${EXTRACTION_MAX_ATTEMPTS} failed after ${Date.now() - t0} ms:`,
+                error?.status || "",
+                error?.message || error
+            );
+
+            if (attempt >= EXTRACTION_MAX_ATTEMPTS || !isTransientGroqError(error)) {
+                break;
+            }
+        }
+    }
+
+    throw extractionFailure(lastError);
 };
 
 // Test hook only.
@@ -1229,13 +1337,25 @@ const stripJsonFences = (content) => {
 // GROQ EXTRACTION
 // ============================================
 
+// options (all optional):
+//   promptEvidence  shorter additional-OCR text for the Groq PROMPT only.
+//                   The full additionalOcrText is still used as evidence
+//                   when validating what Groq returns.
+//   signal          AbortSignal (client disconnected)
+//   log             (message) => void
 async function extractProductInfo(
     ocrText,
-    additionalOcrText = ""
+    additionalOcrText = "",
+    options = {}
 ) {
     if (!ocrText || !ocrText.trim()) {
         throw new Error("OCR text is required");
     }
+
+    const promptAdditionalText =
+        options && typeof options.promptEvidence === "string"
+            ? options.promptEvidence
+            : additionalOcrText;
 
     const prompt = `
 You are a food-label data extraction system.
@@ -1567,11 +1687,11 @@ ${ocrText}
 
 ADDITIONAL OCR PASSES / VIEWS:
 
-${additionalOcrText}
+${promptAdditionalText}
 `;
 
-    const completion =
-        await getGroqClient().chat.completions.create({
+    const completion = await createExtractionCompletion(
+        {
             model: "openai/gpt-oss-20b",
 
             temperature: 0,
@@ -1586,7 +1706,9 @@ ${additionalOcrText}
                     content: prompt,
                 },
             ],
-        });
+        },
+        { signal: options?.signal, log: options?.log }
+    );
 
     const content =
         completion.choices?.[0]?.message?.content;

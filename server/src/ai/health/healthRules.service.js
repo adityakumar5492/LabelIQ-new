@@ -1,24 +1,34 @@
 "use strict";
 
 /**
- * LabelIQ - deterministic health rule engine (Phase 3).
+ * LabelIQ - deterministic health rule engine.
  *
- * AI explains. Deterministic rules decide.
+ * AI/RAG explains and provides evidence.
+ * Deterministic rules decide the health score.
  *
- * This module is PURE: no database, no MongoDB, no Groq, no RAG,
- * no network. Given the same input it always returns the same
- * score, grade, penalties and rule matches. scan.service.js loads
- * the data from PostgreSQL, calls evaluateHealthRules(), then stores
- * the returned matches. This is the ONLY place where the health
- * score is calculated.
+ * This module is PURE:
+ * - no database
+ * - no MongoDB
+ * - no Groq
+ * - no RAG
+ * - no network
  *
- * Score  = 100 - sum(penalties of recorded rule matches), clamped
- *          to 0..100.
- * Grade  = 90-100 A, 75-89 B, 50-74 C, 0-49 D.
+ * Given the same input, it always returns the same:
+ * - score
+ * - grade
+ * - penalties
+ * - rule matches
+ *
+ * Score = 100 - sum(penalties)
+ * Grade:
+ *   90-100 = A
+ *   75-89  = B
+ *   50-74  = C
+ *   0-49   = D
  */
 
 // ============================================
-// CONSTANTS (values unchanged from the original engine)
+// CONSTANTS
 // ============================================
 
 const MAX_SCORE = 100;
@@ -32,6 +42,7 @@ const PERSONAL_PENALTIES = {
         SODIUM_LIMIT: 8,
         DIETARY_CONFLICT: 8,
     },
+
     strict: {
         USER_BLOCKLIST: 25,
         CALORIE_LIMIT: 8,
@@ -48,9 +59,11 @@ const PERSONAL_RULE_CODES = {
     SODIUM: "SODIUM_LIMIT",
 };
 
-// SUGAR_LIMIT means declared nutrition exceeded the user's limit.
+// SUGAR_LIMIT is a nutrition-limit rule.
 // It is NOT hidden sugar.
-const HIDDEN_SUGAR_EXCLUDED_CODES = [PERSONAL_RULE_CODES.SUGAR];
+const HIDDEN_SUGAR_EXCLUDED_CODES = [
+    PERSONAL_RULE_CODES.SUGAR,
+];
 
 const BLOCKLIST_ALIASES = {
     "ARTIFICIAL SWEETENER": [
@@ -79,10 +92,90 @@ const HIGH_SUGAR_TERMS = [
     "MALTODEXTRIN",
 ];
 
+// ============================================
+// INGREDIENT RULE ALIASES
+// ============================================
+
+/**
+ * Different labels can represent the same ingredient.
+ *
+ * Example:
+ * E621
+ * INS 621
+ * 621
+ * MSG
+ * Monosodium Glutamate
+ *
+ * All belong to the same logical rule.
+ */
+const INGREDIENT_RULE_ALIASES = {
+    E621: [
+        "E621",
+        "INS 621",
+        "621",
+        "MSG",
+        "MONOSODIUM GLUTAMATE",
+        "MONOSODIUM GLUTAMATE (MSG)",
+    ],
+
+    E211: [
+        "E211",
+        "INS 211",
+        "211",
+        "SODIUM BENZOATE",
+    ],
+
+    E320: [
+        "E320",
+        "INS 320",
+        "320",
+        "BHA",
+        "BUTYLATED HYDROXYANISOLE",
+    ],
+
+    SUGAR_GLUCOS_SYRUP: [
+        "GLUCOSE SYRUP",
+        "GLUCOSE",
+        "DEXTROSE",
+    ],
+
+    SUGAR_MALTODEXTRIN: [
+        "MALTODEXTRIN",
+    ],
+
+    SUGAR_HFCS: [
+        "HIGH FRUCTOSE CORN SYRUP",
+        "HFCS",
+        "FRUCTOSE CORN SYRUP",
+    ],
+};
+
+/**
+ * Maps aliases/rule codes to one logical rule.
+ *
+ * This prevents:
+ * E621 + MSG
+ *
+ * from being penalized twice for the same ingredient.
+ */
+const RULE_CODE_ALIAS_GROUPS = {
+    E621: "E621",
+    E211: "E211",
+    E320: "E320",
+    SUGAR_GLUCOS_SYRUP: "SUGAR_GLUCOS_SYRUP",
+    SUGAR_MALTODEXTRIN: "SUGAR_MALTODEXTRIN",
+    SUGAR_HFCS: "SUGAR_HFCS",
+};
+
+// ============================================
+// DIETARY MODES
+// ============================================
+
 const DIETARY_MODES = {
     vegan: {
         code: "DIET_VEGAN",
         label: "vegan",
+
         terms: [
             "MILK",
             "BUTTERMILK",
@@ -109,6 +202,7 @@ const DIETARY_MODES = {
             "YOGHURT",
             "CARMINE",
         ],
+
         exceptions: [
             "COCONUT MILK",
             "ALMOND MILK",
@@ -130,6 +224,7 @@ const DIETARY_MODES = {
     "gluten-free": {
         code: "DIET_GLUTEN_FREE",
         label: "gluten-free",
+
         terms: [
             "WHEAT",
             "BARLEY",
@@ -143,7 +238,11 @@ const DIETARY_MODES = {
             "BULGUR",
             "COUSCOUS",
         ],
-        exceptions: ["GLUTEN FREE", "GLUTEN-FREE"],
+
+        exceptions: [
+            "GLUTEN FREE",
+            "GLUTEN-FREE",
+        ],
     },
 
     keto: {
@@ -163,9 +262,6 @@ const DIETARY_MODES = {
 // SAFE NUMBER HELPERS
 // ============================================
 
-// Finite number or null. null / undefined / "" / "   " / "abc" /
-// NaN / Infinity / booleans / objects all become null. 0 stays 0.
-// (The old helper turned "   " into 0 and true into 1.)
 const toFiniteNumber = (value) => {
     if (typeof value === "number") {
         return Number.isFinite(value) ? value : null;
@@ -186,16 +282,14 @@ const toFiniteNumber = (value) => {
     return null;
 };
 
-// Nutrition values and user limits can never be negative.
-// A negative value is malformed, so it is treated as missing.
 const toNonNegativeNumber = (value) => {
     const number = toFiniteNumber(value);
 
-    return number !== null && number >= 0 ? number : null;
+    return number !== null && number >= 0
+        ? number
+        : null;
 };
 
-// A penalty is a non-negative number. Anything else is 0, so a
-// malformed rule row can never raise the score above 100.
 const toPenalty = (value) => {
     return toNonNegativeNumber(value) ?? 0;
 };
@@ -205,11 +299,18 @@ const round2 = (value) => {
 };
 
 const hasOwn = (object, key) => {
-    return Object.prototype.hasOwnProperty.call(object, key);
+    return Object.prototype.hasOwnProperty.call(
+        object,
+        key
+    );
 };
 
 const isPlainObject = (value) => {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
+    return (
+        value !== null &&
+        typeof value === "object" &&
+        !Array.isArray(value)
+    );
 };
 
 // ============================================
@@ -217,10 +318,19 @@ const isPlainObject = (value) => {
 // ============================================
 
 const escapeRegex = (text) => {
-    return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return String(text).replace(
+        /[.*+?^${}()|[\]\\]/g,
+        "\\$&"
+    );
 };
 
-// Case-insensitive whole-term matching.
+/**
+ * Case-insensitive whole-term matching.
+ *
+ * Prevents:
+ * MILK matching "MILKSHAKE"
+ * E621 matching "E6210"
+ */
 const containsTerm = (text, term) => {
     if (!text || !term) {
         return false;
@@ -234,18 +344,29 @@ const containsTerm = (text, term) => {
     }
 
     const regex = new RegExp(
-        `(?<![A-Za-z0-9])${escapeRegex(normalizedTerm)}s?(?![A-Za-z0-9])`,
+        `(?<![A-Za-z0-9])${escapeRegex(
+            normalizedTerm
+        )}s?(?![A-Za-z0-9])`,
         "i"
     );
 
     return regex.test(normalizedText);
 };
 
-const stripExceptions = (text, exceptions = []) => {
+const stripExceptions = (
+    text,
+    exceptions = []
+) => {
     let result = text;
 
     for (const phrase of exceptions) {
-        result = result.replace(new RegExp(escapeRegex(phrase), "gi"), " ");
+        result = result.replace(
+            new RegExp(
+                escapeRegex(phrase),
+                "gi"
+            ),
+            " "
+        );
     }
 
     return result;
@@ -258,15 +379,125 @@ const normalizeKey = (text) => {
         .toLowerCase();
 };
 
+/**
+ * Normalize ingredient text for rule matching.
+ */
+const normalizeIngredientText = (value) => {
+    return String(value ?? "")
+        .toUpperCase()
+        .replace(/[()[\],.:;|/]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+};
+
+// ============================================
+// INGREDIENT RULE MATCHING
+// ============================================
+
+const getRuleAliases = (rule) => {
+    const ruleCode = String(
+        rule?.rule_code ?? ""
+    ).trim();
+
+    const aliases = [];
+
+    // Always include the DB pattern.
+    if (rule?.pattern) {
+        aliases.push(
+            String(rule.pattern)
+        );
+    }
+
+    // Add aliases for known logical rules.
+    if (
+        ruleCode &&
+        INGREDIENT_RULE_ALIASES[ruleCode]
+    ) {
+        aliases.push(
+            ...INGREDIENT_RULE_ALIASES[ruleCode]
+        );
+    }
+
+    const logicalGroup =
+        RULE_CODE_ALIAS_GROUPS[ruleCode];
+
+    if (
+        logicalGroup &&
+        INGREDIENT_RULE_ALIASES[
+            logicalGroup
+        ]
+    ) {
+        aliases.push(
+            ...INGREDIENT_RULE_ALIASES[
+                logicalGroup
+            ]
+        );
+    }
+
+    return [
+        ...new Set(
+            aliases
+                .map(normalizeIngredientText)
+                .filter(Boolean)
+        ),
+    ];
+};
+
+/**
+ * Checks whether an ingredient matches
+ * a database rule or one of its known aliases.
+ */
+const matchesIngredientRule = (
+    ingredientName,
+    rule
+) => {
+    const ingredient =
+        normalizeIngredientText(
+            ingredientName
+        );
+
+    if (!ingredient) {
+        return false;
+    }
+
+    const aliases =
+        getRuleAliases(rule);
+
+    return aliases.some((alias) =>
+        containsTerm(
+            ingredient,
+            alias
+        )
+    );
+};
+
+/**
+ * Convert aliases to one logical rule code.
+ */
+const getLogicalRuleCode = (
+    ruleCode
+) => {
+    const code = String(
+        ruleCode ?? ""
+    ).trim();
+
+    return (
+        RULE_CODE_ALIAS_GROUPS[code] ||
+        code
+    );
+};
+
 // ============================================
 // PROFILE NORMALIZERS
 // ============================================
 
-// Returns a supported dietary mode key, or null.
-// "none", "", unknown values and prototype names ("constructor")
-// all become null (no dietary rules applied).
-const normalizeDietaryMode = (mode) => {
-    if (!mode || typeof mode !== "string") {
+const normalizeDietaryMode = (
+    mode
+) => {
+    if (
+        !mode ||
+        typeof mode !== "string"
+    ) {
         return null;
     }
 
@@ -275,15 +506,24 @@ const normalizeDietaryMode = (mode) => {
         .toLowerCase()
         .replace(/[\s_]+/g, "-");
 
-    return hasOwn(DIETARY_MODES, normalized) ? normalized : null;
+    return hasOwn(
+        DIETARY_MODES,
+        normalized
+    )
+        ? normalized
+        : null;
 };
 
-// Only "strict" (any letter case, surrounding spaces ignored) is
-// strict. Everything else, including unknown values, is moderate.
-const normalizeStrictness = (strictness) => {
+const normalizeStrictness = (
+    strictness
+) => {
     if (
-        typeof strictness === "string" &&
-        strictness.trim().toLowerCase() === "strict"
+        typeof strictness ===
+            "string" &&
+        strictness
+            .trim()
+            .toLowerCase() ===
+            "strict"
     ) {
         return "strict";
     }
@@ -291,40 +531,61 @@ const normalizeStrictness = (strictness) => {
     return "moderate";
 };
 
-// In strict mode, medium personalized issues become high.
-const getSeverity = (baseSeverity, strictness) => {
-    if (strictness === "strict" && baseSeverity === "medium") {
+const getSeverity = (
+    baseSeverity,
+    strictness
+) => {
+    if (
+        strictness === "strict" &&
+        baseSeverity === "medium"
+    ) {
         return "high";
     }
 
     return baseSeverity;
 };
 
-// Accepts the database row (snake_case) and also camelCase, so a
-// renamed property can never silently drop a user value.
-// 0 is a valid value and is kept. null / undefined / negative /
-// non numeric values become null (= "no limit set").
-const readHealthProfile = (profile) => {
+/**
+ * Reads both DB snake_case and
+ * application camelCase fields.
+ */
+const readHealthProfile = (
+    profile
+) => {
     if (!isPlainObject(profile)) {
         return null;
     }
 
     return {
-        calorieLimit: toNonNegativeNumber(
-            profile.calorie_limit ?? profile.calorieLimit
-        ),
-        sugarLimit: toNonNegativeNumber(
-            profile.max_sugar_threshold ?? profile.maxSugarThreshold
-        ),
-        sodiumLimit: toNonNegativeNumber(
-            profile.max_sodium_threshold ?? profile.maxSodiumThreshold
-        ),
-        dietaryMode: normalizeDietaryMode(
-            profile.dietary_mode ?? profile.dietaryMode
-        ),
-        strictness: normalizeStrictness(
-            profile.analysis_strictness ?? profile.analysisStrictness
-        ),
+        calorieLimit:
+            toNonNegativeNumber(
+                profile.calorie_limit ??
+                    profile.calorieLimit
+            ),
+
+        sugarLimit:
+            toNonNegativeNumber(
+                profile.max_sugar_threshold ??
+                    profile.maxSugarThreshold
+            ),
+
+        sodiumLimit:
+            toNonNegativeNumber(
+                profile.max_sodium_threshold ??
+                    profile.maxSodiumThreshold
+            ),
+
+        dietaryMode:
+            normalizeDietaryMode(
+                profile.dietary_mode ??
+                    profile.dietaryMode
+            ),
+
+        strictness:
+            normalizeStrictness(
+                profile.analysis_strictness ??
+                    profile.analysisStrictness
+            ),
     };
 };
 
@@ -332,10 +593,15 @@ const readHealthProfile = (profile) => {
 // RULE CATEGORIES
 // ============================================
 
-const getMatchCategory = (code) => {
+const getMatchCategory = (
+    code
+) => {
     const ruleCode = String(code);
 
-    if (ruleCode === PERSONAL_RULE_CODES.BLOCKLIST) {
+    if (
+        ruleCode ===
+        PERSONAL_RULE_CODES.BLOCKLIST
+    ) {
         return "blocklist";
     }
 
@@ -344,9 +610,12 @@ const getMatchCategory = (code) => {
     }
 
     if (
-        ruleCode === PERSONAL_RULE_CODES.CALORIE ||
-        ruleCode === PERSONAL_RULE_CODES.SUGAR ||
-        ruleCode === PERSONAL_RULE_CODES.SODIUM
+        ruleCode ===
+            PERSONAL_RULE_CODES.CALORIE ||
+        ruleCode ===
+            PERSONAL_RULE_CODES.SUGAR ||
+        ruleCode ===
+            PERSONAL_RULE_CODES.SODIUM
     ) {
         return "nutrition_limit";
     }
@@ -354,46 +623,81 @@ const getMatchCategory = (code) => {
     return "general";
 };
 
-// SUGAR_xxx general rules are hidden sugar. SUGAR_LIMIT is not.
-const isHiddenSugarCode = (code) => {
+const isHiddenSugarCode = (
+    code
+) => {
     const ruleCode = String(code);
 
     return (
         ruleCode.startsWith("SUGAR_") &&
-        !HIDDEN_SUGAR_EXCLUDED_CODES.includes(ruleCode)
+        !HIDDEN_SUGAR_EXCLUDED_CODES.includes(
+            ruleCode
+        )
     );
 };
 
-// One definition of "hidden sugar rule", used by the dietary check
-// and by hiddenSugarDetected (they used to disagree).
-const isHiddenSugarRule = (rule) => {
+const isHiddenSugarRule = (
+    rule
+) => {
     return (
         Boolean(rule) &&
-        (rule.rule_type === "hidden_sugar" || isHiddenSugarCode(rule.rule_code))
+        (
+            rule.rule_type ===
+                "hidden_sugar" ||
+            isHiddenSugarCode(
+                rule.rule_code
+            )
+        )
     );
 };
 
-const categorizeMatches = (matches) => {
-    const list = Array.isArray(matches) ? matches : [];
+const categorizeMatches = (
+    matches
+) => {
+    const list = Array.isArray(matches)
+        ? matches
+        : [];
 
-    const categoryOf = (match) => getMatchCategory(match.rule_code);
+    const categoryOf = (match) =>
+        getMatchCategory(
+            match.rule_code
+        );
 
     return {
-        generalIssues: list.filter((match) => categoryOf(match) === "general"),
+        generalIssues: list.filter(
+            (match) =>
+                categoryOf(match) ===
+                "general"
+        ),
+
         blocklistIssues: list.filter(
-            (match) => categoryOf(match) === "blocklist"
+            (match) =>
+                categoryOf(match) ===
+                "blocklist"
         ),
+
         calorieIssues: list.filter(
-            (match) => match.rule_code === PERSONAL_RULE_CODES.CALORIE
+            (match) =>
+                match.rule_code ===
+                PERSONAL_RULE_CODES.CALORIE
         ),
+
         sugarIssues: list.filter(
-            (match) => match.rule_code === PERSONAL_RULE_CODES.SUGAR
+            (match) =>
+                match.rule_code ===
+                PERSONAL_RULE_CODES.SUGAR
         ),
+
         sodiumIssues: list.filter(
-            (match) => match.rule_code === PERSONAL_RULE_CODES.SODIUM
+            (match) =>
+                match.rule_code ===
+                PERSONAL_RULE_CODES.SODIUM
         ),
+
         dietaryConflicts: list.filter(
-            (match) => categoryOf(match) === "dietary"
+            (match) =>
+                categoryOf(match) ===
+                "dietary"
         ),
     };
 };
@@ -402,24 +706,30 @@ const categorizeMatches = (matches) => {
 // SCORE + GRADE
 // ============================================
 
-// Always a number from 0 to 100. A missing / invalid score
-// counts as "no penalties" only when the caller passes NaN
-// through calculateScore, never silently here.
-const clampScore = (value) => {
-    const number = toFiniteNumber(value);
+const clampScore = (
+    value
+) => {
+    const number =
+        toFiniteNumber(value);
 
     if (number === null) {
         return null;
     }
 
-    return Math.min(MAX_SCORE, Math.max(MIN_SCORE, number));
+    return Math.min(
+        MAX_SCORE,
+        Math.max(
+            MIN_SCORE,
+            number
+        )
+    );
 };
 
-// 90-100 A, 75-89 B, 50-74 C, 0-49 D.
-// Out of range numbers are clamped first (-20 -> D, 150 -> A).
-// A missing / non numeric score has no grade (null).
-const calculateGrade = (score) => {
-    const value = clampScore(score);
+const calculateGrade = (
+    score
+) => {
+    const value =
+        clampScore(score);
 
     if (value === null) {
         return null;
@@ -440,22 +750,32 @@ const calculateGrade = (score) => {
     return "D";
 };
 
-// 100 - total penalties, never below 0 and never above 100.
-// Invalid penalties count as 0.
-const calculateScore = (penalties) => {
-    const list = Array.isArray(penalties) ? penalties : [];
+const calculateScore = (
+    penalties
+) => {
+    const list = Array.isArray(
+        penalties
+    )
+        ? penalties
+        : [];
 
     let total = 0;
 
     for (const penalty of list) {
-        total += toPenalty(penalty);
+        total += toPenalty(
+            penalty
+        );
     }
 
-    return clampScore(round2(MAX_SCORE - total));
+    return clampScore(
+        round2(
+            MAX_SCORE - total
+        )
+    );
 };
 
 // ============================================
-// DIETARY CONFLICT CHECK
+// DIETARY CONFLICT
 // ============================================
 
 const getDietaryConflict = (
@@ -469,15 +789,26 @@ const getDietaryConflict = (
 
     // Keto / Type-2 diabetic
     if (modeConfig.usesSugarRules) {
-        const sugarRule = (generalRulesMatched || []).find(isHiddenSugarRule);
+        const sugarRule =
+            (
+                generalRulesMatched ||
+                []
+            ).find(
+                isHiddenSugarRule
+            );
 
         if (sugarRule) {
             return `matches the "${sugarRule.rule_name}" rule`;
         }
 
-        const term = HIGH_SUGAR_TERMS.find((item) =>
-            containsTerm(ingredientName, item)
-        );
+        const term =
+            HIGH_SUGAR_TERMS.find(
+                (item) =>
+                    containsTerm(
+                        ingredientName,
+                        item
+                    )
+            );
 
         if (term) {
             return `contains ${term.toLowerCase()}`;
@@ -487,16 +818,28 @@ const getDietaryConflict = (
     }
 
     // Vegan / Gluten-free
-    const cleanedName = stripExceptions(
-        String(ingredientName ?? ""),
-        modeConfig.exceptions
-    );
+    const cleanedName =
+        stripExceptions(
+            String(
+                ingredientName ?? ""
+            ),
+            modeConfig.exceptions
+        );
 
-    const term = (modeConfig.terms || []).find((item) =>
-        containsTerm(cleanedName, item)
-    );
+    const term =
+        (
+            modeConfig.terms ||
+            []
+        ).find((item) =>
+            containsTerm(
+                cleanedName,
+                item
+            )
+        );
 
-    return term ? `contains ${term.toLowerCase()}` : null;
+    return term
+        ? `contains ${term.toLowerCase()}`
+        : null;
 };
 
 // ============================================
@@ -504,61 +847,131 @@ const getDietaryConflict = (
 // ============================================
 
 /**
- * @param {object}   input
- * @param {Array}    input.ingredients  [{ id, name }] in label order
- * @param {Array}    input.generalRules ingredient_rules rows
- * @param {Array}    input.blocklist    [{ ingredient_name, reason }]
- * @param {object}   input.healthProfile health_profiles row or null
- * @param {object}   input.nutrition    { calories, total_sugars_g,
- *                                        added_sugars_g, sodium_mg }
+ * @param {object} input
+ *
+ * @param {Array} input.ingredients
+ *   [{ id, name }]
+ *
+ * @param {Array} input.generalRules
+ *   ingredient_rules rows
+ *
+ * @param {Array} input.blocklist
+ *   [{ ingredient_name, reason }]
+ *
+ * @param {object} input.healthProfile
+ *   health_profiles row or null
+ *
+ * @param {object} input.nutrition
+ *   {
+ *      calories,
+ *      total_sugars_g,
+ *      added_sugars_g,
+ *      sodium_mg
+ *   }
  *
  * @returns {{
- *   score: number, grade: string, matches: Array,
- *   totalPenalty: number, hiddenSugarDetected: boolean,
- *   breakdown: object, healthProfile: object|null,
+ *   score: number,
+ *   grade: string,
+ *   matches: Array,
+ *   totalPenalty: number,
+ *   hiddenSugarDetected: boolean,
+ *   breakdown: object,
+ *   healthProfile: object|null,
  *   personalization: object
  * }}
  */
-const evaluateHealthRules = (input = {}) => {
-    const rawProfile = isPlainObject(input.healthProfile)
-        ? input.healthProfile
+const evaluateHealthRules = (
+    input = {}
+) => {
+    const rawProfile =
+        isPlainObject(
+            input.healthProfile
+        )
+            ? input.healthProfile
+            : null;
+
+    const profile =
+        readHealthProfile(
+            rawProfile
+        );
+
+    const strictness = profile
+        ? profile.strictness
+        : "moderate";
+
+    const dietaryMode = profile
+        ? profile.dietaryMode
         : null;
-    const profile = readHealthProfile(rawProfile);
 
-    const strictness = profile ? profile.strictness : "moderate";
-    const dietaryMode = profile ? profile.dietaryMode : null;
-    const penalties = PERSONAL_PENALTIES[strictness];
+    const penalties =
+        PERSONAL_PENALTIES[
+            strictness
+        ];
 
-    const nutrition = isPlainObject(input.nutrition) ? input.nutrition : {};
+    const nutrition =
+        isPlainObject(
+            input.nutrition
+        )
+            ? input.nutrition
+            : {};
 
-    const generalRules = Array.isArray(input.generalRules)
-        ? input.generalRules.filter(isPlainObject)
-        : [];
+    const generalRules =
+        Array.isArray(
+            input.generalRules
+        )
+            ? input.generalRules.filter(
+                  isPlainObject
+              )
+            : [];
 
-    const blocklist = Array.isArray(input.blocklist)
-        ? input.blocklist.filter(isPlainObject)
-        : [];
+    const blocklist =
+        Array.isArray(
+            input.blocklist
+        )
+            ? input.blocklist.filter(
+                  isPlainObject
+              )
+            : [];
 
-    // One entry per distinct ingredient name (case-insensitive,
-    // label order kept). A repeated ingredient can never be
-    // penalized twice.
+    // ========================================
+    // UNIQUE INGREDIENTS
+    // ========================================
+
     const ingredients = [];
-    const seenIngredientNames = new Set();
 
-    for (const item of Array.isArray(input.ingredients)
+    const seenIngredientNames =
+        new Set();
+
+    for (const item of Array.isArray(
+        input.ingredients
+    )
         ? input.ingredients
         : []) {
-        if (!isPlainObject(item) || typeof item.name !== "string") {
+        if (
+            !isPlainObject(item) ||
+            typeof item.name !==
+                "string"
+        ) {
             continue;
         }
 
-        const key = normalizeKey(item.name);
+        const key =
+            normalizeKey(
+                item.name
+            );
 
-        if (!key || seenIngredientNames.has(key)) {
+        if (
+            !key ||
+            seenIngredientNames.has(
+                key
+            )
+        ) {
             continue;
         }
 
-        seenIngredientNames.add(key);
+        seenIngredientNames.add(
+            key
+        );
 
         ingredients.push({
             id: item.id ?? null,
@@ -567,299 +980,626 @@ const evaluateHealthRules = (input = {}) => {
         });
     }
 
-    // ---------- match bookkeeping ----------
+    // ========================================
+    // MATCH BOOKKEEPING
+    // ========================================
 
     const matches = [];
-    const seenRuleKeys = new Set();
-    let hiddenSugarDetected = false;
 
-    // Returns true when the match was recorded (= penalty applied).
-    const addMatch = (match) => {
-        const scope = match.ingredientKey ?? "none";
-        const codeKey = `${scope}:${match.ruleCode}`;
+    const seenRuleKeys =
+        new Set();
 
-        // A rule fires once per ingredient (or once per product for
-        // nutrition rules).
-        if (seenRuleKeys.has(codeKey)) {
+    let hiddenSugarDetected =
+        false;
+
+    /**
+     * Returns true if a match was
+     * actually recorded.
+     */
+    const addMatch = (
+        match
+    ) => {
+        const scope =
+            match.ingredientKey ??
+            "none";
+
+        /**
+         * Logical rule code prevents
+         * aliases from stacking.
+         *
+         * Example:
+         * ingredient = MSG
+         *
+         * DB rule 1 = E621
+         * DB rule 2 = MSG
+         *
+         * Only one penalty.
+         */
+        const logicalRuleCode =
+            getLogicalRuleCode(
+                match.ruleCode
+            );
+
+        const codeKey =
+            `${scope}:${logicalRuleCode}`;
+
+        if (
+            seenRuleKeys.has(
+                codeKey
+            )
+        ) {
             return false;
         }
 
-        // Alias rows of one logical rule (E621 / MSG / Monosodium
-        // Glutamate stored under different codes but one rule name)
-        // must not stack penalties on the same ingredient.
-        const nameKey = match.dedupeByName
-            ? `${scope}:name:${normalizeKey(match.ruleName)}`
-            : null;
+        const nameKey =
+            match.dedupeByName
+                ? `${scope}:name:${normalizeKey(
+                      match.ruleName
+                  )}`
+                : null;
 
-        if (nameKey && seenRuleKeys.has(nameKey)) {
+        if (
+            nameKey &&
+            seenRuleKeys.has(
+                nameKey
+            )
+        ) {
             return false;
         }
 
-        seenRuleKeys.add(codeKey);
+        seenRuleKeys.add(
+            codeKey
+        );
 
         if (nameKey) {
-            seenRuleKeys.add(nameKey);
+            seenRuleKeys.add(
+                nameKey
+            );
         }
 
         matches.push({
-            ingredient_id: match.ingredientId ?? null,
-            rule_code: match.ruleCode,
-            rule_name: match.ruleName,
-            matched_value: match.matchedValue,
-            severity: match.severity,
-            explanation: match.explanation,
-            penalty: toPenalty(match.penalty),
+            ingredient_id:
+                match.ingredientId ??
+                null,
+
+            rule_code:
+                match.ruleCode,
+
+            rule_name:
+                match.ruleName,
+
+            matched_value:
+                match.matchedValue,
+
+            severity:
+                match.severity,
+
+            explanation:
+                match.explanation,
+
+            penalty:
+                toPenalty(
+                    match.penalty
+                ),
         });
 
         return true;
     };
 
-    const generalRulesByIngredient = new Map();
+    const generalRulesByIngredient =
+        new Map();
 
-    // ---------- 1. GENERAL INGREDIENT RULES ----------
+    // ========================================
+    // 1. GENERAL INGREDIENT RULES
+    // ========================================
 
     for (const ingredient of ingredients) {
         const matchedRules = [];
 
         for (const rule of generalRules) {
-            if (!containsTerm(ingredient.name, rule.pattern)) {
+            /**
+             * IMPORTANT:
+             *
+             * Do not use RAG here.
+             *
+             * Only DB health rules and their
+             * explicit aliases can create
+             * a health penalty.
+             */
+            if (
+                !matchesIngredientRule(
+                    ingredient.name,
+                    rule
+                )
+            ) {
                 continue;
             }
 
-            matchedRules.push(rule);
+            matchedRules.push(
+                rule
+            );
 
-            const recorded = addMatch({
-                ingredientId: ingredient.id,
-                ingredientKey: ingredient.key,
-                ruleCode: rule.rule_code,
-                ruleName: rule.rule_name,
-                matchedValue: ingredient.name,
-                severity: rule.severity,
-                explanation: rule.explanation,
-                penalty: rule.score_penalty,
-                dedupeByName: true,
-            });
+            const recorded =
+                addMatch({
+                    ingredientId:
+                        ingredient.id,
 
-            if (recorded && isHiddenSugarRule(rule)) {
-                hiddenSugarDetected = true;
+                    ingredientKey:
+                        ingredient.key,
+
+                    ruleCode:
+                        rule.rule_code,
+
+                    ruleName:
+                        rule.rule_name,
+
+                    matchedValue:
+                        ingredient.name,
+
+                    severity:
+                        rule.severity,
+
+                    explanation:
+                        rule.explanation,
+
+                    penalty:
+                        rule.score_penalty,
+
+                    dedupeByName:
+                        true,
+                });
+
+            if (
+                recorded &&
+                isHiddenSugarRule(
+                    rule
+                )
+            ) {
+                hiddenSugarDetected =
+                    true;
             }
         }
 
-        generalRulesByIngredient.set(ingredient.key, matchedRules);
+        generalRulesByIngredient.set(
+            ingredient.key,
+            matchedRules
+        );
     }
 
-    // ---------- 2. USER BLOCKLIST ----------
+    // ========================================
+    // 2. USER BLOCKLIST
+    // ========================================
 
     for (const ingredient of ingredients) {
         for (const blocked of blocklist) {
-            const blockedName = String(blocked.ingredient_name ?? "")
-                .trim()
-                .toUpperCase();
+            const blockedName =
+                String(
+                    blocked.ingredient_name ??
+                        ""
+                )
+                    .trim()
+                    .toUpperCase();
 
             if (!blockedName) {
                 continue;
             }
 
-            const singular = blockedName.endsWith("S")
-                ? blockedName.slice(0, -1)
-                : blockedName;
+            const singular =
+                blockedName.endsWith(
+                    "S"
+                )
+                    ? blockedName.slice(
+                          0,
+                          -1
+                      )
+                    : blockedName;
 
-            const aliases = hasOwn(BLOCKLIST_ALIASES, singular)
-                ? BLOCKLIST_ALIASES[singular]
-                : hasOwn(BLOCKLIST_ALIASES, blockedName)
-                  ? BLOCKLIST_ALIASES[blockedName]
-                  : [];
+            const aliases =
+                hasOwn(
+                    BLOCKLIST_ALIASES,
+                    singular
+                )
+                    ? BLOCKLIST_ALIASES[
+                          singular
+                      ]
+                    : hasOwn(
+                          BLOCKLIST_ALIASES,
+                          blockedName
+                      )
+                    ? BLOCKLIST_ALIASES[
+                          blockedName
+                      ]
+                    : [];
 
-            const searchTerms = [blockedName, ...aliases];
+            const searchTerms = [
+                blockedName,
+                ...aliases,
+            ];
 
-            const isBlocked = searchTerms.some((term) =>
-                containsTerm(ingredient.name, term)
-            );
+            const isBlocked =
+                searchTerms.some(
+                    (term) =>
+                        containsTerm(
+                            ingredient.name,
+                            term
+                        )
+                );
 
             if (!isBlocked) {
                 continue;
             }
 
             addMatch({
-                ingredientId: ingredient.id,
-                ingredientKey: ingredient.key,
-                ruleCode: PERSONAL_RULE_CODES.BLOCKLIST,
-                ruleName: "User Blocklist",
-                matchedValue: ingredient.name,
+                ingredientId:
+                    ingredient.id,
+
+                ingredientKey:
+                    ingredient.key,
+
+                ruleCode:
+                    PERSONAL_RULE_CODES.BLOCKLIST,
+
+                ruleName:
+                    "User Blocklist",
+
+                matchedValue:
+                    ingredient.name,
+
                 severity: "high",
+
                 explanation:
                     blocked.reason ||
                     "Ingredient is present in your personal blocklist.",
-                penalty: penalties.USER_BLOCKLIST,
+
+                penalty:
+                    penalties.USER_BLOCKLIST,
             });
         }
     }
 
-    // ---------- 3. NUTRITION LIMITS ----------
-    //
-    // Only when a profile exists. A missing nutrition value or a
-    // missing limit never creates a violation. Zero stays zero.
-    // The comparison is strictly "greater than" the limit.
+    // ========================================
+    // 3. NUTRITION LIMITS
+    // ========================================
+
+    /**
+     * Nutrition limits are applied only
+     * when:
+     *
+     * - profile exists
+     * - nutrition value exists
+     * - corresponding limit exists
+     *
+     * Missing values never create
+     * false violations.
+     */
 
     if (profile) {
-        const calories = toNonNegativeNumber(nutrition.calories);
+        // ------------------------------------
+        // CALORIES
+        // ------------------------------------
+
+        const calories =
+            toNonNegativeNumber(
+                nutrition.calories
+            );
 
         if (
             calories !== null &&
-            profile.calorieLimit !== null &&
-            calories > profile.calorieLimit
+            profile.calorieLimit !==
+                null &&
+            calories >
+                profile.calorieLimit
         ) {
             addMatch({
                 ingredientId: null,
-                ruleCode: PERSONAL_RULE_CODES.CALORIE,
-                ruleName: "Calorie Limit Exceeded",
-                matchedValue: `${calories} kcal`,
-                severity: getSeverity("medium", strictness),
-                explanation: `Detected calories (${calories} kcal) exceed your calorie limit (${profile.calorieLimit} kcal).`,
-                penalty: penalties.CALORIE_LIMIT,
+
+                ruleCode:
+                    PERSONAL_RULE_CODES.CALORIE,
+
+                ruleName:
+                    "Calorie Limit Exceeded",
+
+                matchedValue:
+                    `${calories} kcal`,
+
+                severity:
+                    getSeverity(
+                        "medium",
+                        strictness
+                    ),
+
+                explanation:
+                    `Detected calories (${calories} kcal) exceed your calorie limit (${profile.calorieLimit} kcal).`,
+
+                penalty:
+                    penalties.CALORIE_LIMIT,
             });
         }
 
-        const sugar = toNonNegativeNumber(nutrition.total_sugars_g);
+        // ------------------------------------
+        // SUGAR
+        // ------------------------------------
+
+        const sugar =
+            toNonNegativeNumber(
+                nutrition.total_sugars_g
+            );
 
         if (
             sugar !== null &&
-            profile.sugarLimit !== null &&
-            sugar > profile.sugarLimit
+            profile.sugarLimit !==
+                null &&
+            sugar >
+                profile.sugarLimit
         ) {
             addMatch({
                 ingredientId: null,
-                ruleCode: PERSONAL_RULE_CODES.SUGAR,
-                ruleName: "Sugar Limit Exceeded",
-                matchedValue: `${sugar} g`,
+
+                ruleCode:
+                    PERSONAL_RULE_CODES.SUGAR,
+
+                ruleName:
+                    "Sugar Limit Exceeded",
+
+                matchedValue:
+                    `${sugar} g`,
+
                 severity: "high",
-                explanation: `Detected total sugars (${sugar} g) exceed your sugar threshold (${profile.sugarLimit} g).`,
-                penalty: penalties.SUGAR_LIMIT,
+
+                explanation:
+                    `Detected total sugars (${sugar} g) exceed your sugar threshold (${profile.sugarLimit} g).`,
+
+                penalty:
+                    penalties.SUGAR_LIMIT,
             });
         }
 
-        const sodium = toNonNegativeNumber(nutrition.sodium_mg);
+        // ------------------------------------
+        // SODIUM
+        // ------------------------------------
+
+        const sodium =
+            toNonNegativeNumber(
+                nutrition.sodium_mg
+            );
 
         if (
             sodium !== null &&
-            profile.sodiumLimit !== null &&
-            sodium > profile.sodiumLimit
+            profile.sodiumLimit !==
+                null &&
+            sodium >
+                profile.sodiumLimit
         ) {
             addMatch({
                 ingredientId: null,
-                ruleCode: PERSONAL_RULE_CODES.SODIUM,
-                ruleName: "Sodium Limit Exceeded",
-                matchedValue: `${sodium} mg`,
-                severity: getSeverity("medium", strictness),
-                explanation: `Detected sodium (${sodium} mg) exceeds your sodium threshold (${profile.sodiumLimit} mg).`,
-                penalty: penalties.SODIUM_LIMIT,
+
+                ruleCode:
+                    PERSONAL_RULE_CODES.SODIUM,
+
+                ruleName:
+                    "Sodium Limit Exceeded",
+
+                matchedValue:
+                    `${sodium} mg`,
+
+                severity:
+                    getSeverity(
+                        "medium",
+                        strictness
+                    ),
+
+                explanation:
+                    `Detected sodium (${sodium} mg) exceeds your sodium threshold (${profile.sodiumLimit} mg).`,
+
+                penalty:
+                    penalties.SODIUM_LIMIT,
             });
         }
     }
 
-    // ---------- 4. DIETARY MODE ----------
+    // ========================================
+    // 4. DIETARY MODE
+    // ========================================
 
     if (dietaryMode) {
-        const modeConfig = DIETARY_MODES[dietaryMode];
+        const modeConfig =
+            DIETARY_MODES[
+                dietaryMode
+            ];
 
         for (const ingredient of ingredients) {
-            const reason = getDietaryConflict(
-                modeConfig,
-                ingredient.name,
-                generalRulesByIngredient.get(ingredient.key) || []
-            );
+            const reason =
+                getDietaryConflict(
+                    modeConfig,
+                    ingredient.name,
+                    generalRulesByIngredient.get(
+                        ingredient.key
+                    ) || []
+                );
 
             if (!reason) {
                 continue;
             }
 
             addMatch({
-                ingredientId: ingredient.id,
-                ingredientKey: ingredient.key,
-                ruleCode: modeConfig.code,
-                ruleName: `Dietary Mode Conflict (${modeConfig.label})`,
-                matchedValue: ingredient.name,
-                severity: getSeverity("medium", strictness),
-                explanation: `Potential conflict with your selected dietary mode (${modeConfig.label}): "${ingredient.name}" ${reason}.`,
-                penalty: penalties.DIETARY_CONFLICT,
+                ingredientId:
+                    ingredient.id,
+
+                ingredientKey:
+                    ingredient.key,
+
+                ruleCode:
+                    modeConfig.code,
+
+                ruleName:
+                    `Dietary Mode Conflict (${modeConfig.label})`,
+
+                matchedValue:
+                    ingredient.name,
+
+                severity:
+                    getSeverity(
+                        "medium",
+                        strictness
+                    ),
+
+                explanation:
+                    `Potential conflict with your selected dietary mode (${modeConfig.label}): "${ingredient.name}" ${reason}.`,
+
+                penalty:
+                    penalties.DIETARY_CONFLICT,
             });
         }
 
-        // Type-2 diabetic: declared added sugar > 0 (one product-level
-        // conflict). Missing added sugar (null) is NOT zero and does
-        // not create a conflict.
-        const addedSugar = toNonNegativeNumber(nutrition.added_sugars_g);
+        // ------------------------------------
+        // TYPE-2 DIABETIC
+        // ------------------------------------
+
+        /**
+         * Added sugar > 0 creates one
+         * product-level conflict.
+         *
+         * null is NOT treated as 0.
+         */
+        const addedSugar =
+            toNonNegativeNumber(
+                nutrition.added_sugars_g
+            );
 
         if (
-            dietaryMode === "type-2-diabetic" &&
+            dietaryMode ===
+                "type-2-diabetic" &&
             addedSugar !== null &&
             addedSugar > 0
         ) {
             addMatch({
                 ingredientId: null,
-                ruleCode: modeConfig.code,
-                ruleName: `Dietary Mode Conflict (${modeConfig.label})`,
-                matchedValue: `${addedSugar} g added sugars`,
-                severity: getSeverity("medium", strictness),
-                explanation: `Potential conflict with your selected dietary mode (${modeConfig.label}): the product contains ${addedSugar} g of added sugars.`,
-                penalty: penalties.DIETARY_CONFLICT,
+
+                ruleCode:
+                    modeConfig.code,
+
+                ruleName:
+                    `Dietary Mode Conflict (${modeConfig.label})`,
+
+                matchedValue:
+                    `${addedSugar} g added sugars`,
+
+                severity:
+                    getSeverity(
+                        "medium",
+                        strictness
+                    ),
+
+                explanation:
+                    `Potential conflict with your selected dietary mode (${modeConfig.label}): the product contains ${addedSugar} g of added sugars.`,
+
+                penalty:
+                    penalties.DIETARY_CONFLICT,
             });
         }
     }
 
-    // ---------- 5. FINAL SCORE (single source of truth) ----------
+    // ========================================
+    // 5. FINAL SCORE
+    // ========================================
 
-    const score = calculateScore(matches.map((match) => match.penalty));
-    const grade = calculateGrade(score);
+    /**
+     * SINGLE SOURCE OF TRUTH
+     *
+     * Score = 100 - total penalties
+     */
+    const score =
+        calculateScore(
+            matches.map(
+                (match) =>
+                    match.penalty
+            )
+        );
 
-    const totalPenalty = round2(
-        matches.reduce((sum, match) => sum + match.penalty, 0)
-    );
+    const grade =
+        calculateGrade(score);
+
+    const totalPenalty =
+        round2(
+            matches.reduce(
+                (sum, match) =>
+                    sum +
+                    match.penalty,
+                0
+            )
+        );
 
     return {
         score,
         grade,
         matches,
         totalPenalty,
+
         hiddenSugarDetected,
-        breakdown: categorizeMatches(matches),
-        healthProfile: rawProfile,
+
+        breakdown:
+            categorizeMatches(
+                matches
+            ),
+
+        healthProfile:
+            rawProfile,
+
         personalization: {
-            profileApplied: Boolean(profile),
+            profileApplied:
+                Boolean(profile),
+
             dietaryMode,
-            analysisStrictness: strictness,
+
+            analysisStrictness:
+                strictness,
         },
     };
 };
 
 // ============================================
-// PENALTIES FOR STORED MATCHES (GET /scan/:id)
+// STORED MATCH PENALTIES
 // ============================================
-//
-// rule_matches has no penalty column (and the schema must not
-// change), so a stored scan's penalties are re-derived from the
-// CURRENT configuration. They are attached ONLY if they reproduce
-// the stored score exactly. If the rules or the user's strictness
-// changed since the scan, penalty is null instead of a wrong number.
-//
-// This never changes the stored score or grade.
 
-const getPersonalPenaltyKey = (ruleCode) => {
-    const code = String(ruleCode);
+/**
+ * rule_matches has no penalty column.
+ *
+ * Therefore penalties are re-derived
+ * from the current configuration.
+ *
+ * This does NOT modify the database.
+ */
+const getPersonalPenaltyKey = (
+    ruleCode
+) => {
+    const code =
+        String(ruleCode);
 
-    if (code === PERSONAL_RULE_CODES.BLOCKLIST) {
+    if (
+        code ===
+        PERSONAL_RULE_CODES.BLOCKLIST
+    ) {
         return "USER_BLOCKLIST";
     }
 
-    if (code === PERSONAL_RULE_CODES.CALORIE) {
+    if (
+        code ===
+        PERSONAL_RULE_CODES.CALORIE
+    ) {
         return "CALORIE_LIMIT";
     }
 
-    if (code === PERSONAL_RULE_CODES.SUGAR) {
+    if (
+        code ===
+        PERSONAL_RULE_CODES.SUGAR
+    ) {
         return "SUGAR_LIMIT";
     }
 
-    if (code === PERSONAL_RULE_CODES.SODIUM) {
+    if (
+        code ===
+        PERSONAL_RULE_CODES.SODIUM
+    ) {
         return "SODIUM_LIMIT";
     }
 
@@ -876,43 +1616,80 @@ const attachStoredPenalties = ({
     strictness,
     storedScore,
 }) => {
-    const list = Array.isArray(matches) ? matches : [];
-    const personal = PERSONAL_PENALTIES[normalizeStrictness(strictness)];
+    const list =
+        Array.isArray(matches)
+            ? matches
+            : [];
 
-    const derived = list.map((match) => {
-        const key = getPersonalPenaltyKey(match.rule_code);
+    const personal =
+        PERSONAL_PENALTIES[
+            normalizeStrictness(
+                strictness
+            )
+        ];
 
-        if (key) {
-            return personal[key];
-        }
+    const derived =
+        list.map((match) => {
+            const key =
+                getPersonalPenaltyKey(
+                    match.rule_code
+                );
 
-        const info =
-            ruleInfo && typeof ruleInfo.get === "function"
-                ? ruleInfo.get(match.rule_code)
-                : null;
+            if (key) {
+                return personal[key];
+            }
 
-        if (!info) {
-            return null;
-        }
+            const info =
+                ruleInfo &&
+                typeof ruleInfo.get ===
+                    "function"
+                    ? ruleInfo.get(
+                          match.rule_code
+                      )
+                    : null;
 
-        return toFiniteNumber(info.score_penalty) === null
-            ? null
-            : toPenalty(info.score_penalty);
-    });
+            if (!info) {
+                return null;
+            }
 
-    const stored = toFiniteNumber(storedScore);
+            return toFiniteNumber(
+                info.score_penalty
+            ) === null
+                ? null
+                : toPenalty(
+                      info.score_penalty
+                  );
+        });
 
-    const complete = derived.every((penalty) => penalty !== null);
+    const stored =
+        toFiniteNumber(
+            storedScore
+        );
+
+    const complete =
+        derived.every(
+            (penalty) =>
+                penalty !== null
+        );
 
     const consistent =
         complete &&
         stored !== null &&
-        Math.abs(calculateScore(derived) - stored) < 0.01;
+        Math.abs(
+            calculateScore(
+                derived
+            ) - stored
+        ) < 0.01;
 
-    return list.map((match, index) => ({
-        ...match,
-        penalty: consistent ? derived[index] : null,
-    }));
+    return list.map(
+        (match, index) => ({
+            ...match,
+
+            penalty: consistent
+                ? derived[index]
+                : null,
+        })
+    );
 };
 
 // ============================================
@@ -927,6 +1704,11 @@ module.exports = {
     BLOCKLIST_ALIASES,
     HIGH_SUGAR_TERMS,
     DIETARY_MODES,
+
+    // ingredient aliases
+    INGREDIENT_RULE_ALIASES,
+    RULE_CODE_ALIAS_GROUPS,
+    matchesIngredientRule,
 
     // engine
     evaluateHealthRules,

@@ -19,7 +19,7 @@
   },
   {
     "name": "lecithin",
-    "description": "Lecithin is a substance commonly obtained from soy or sunflower sources. It is often used as an emulsifier to help ingredients mix together.",
+    "description": "Lecithin is a substance commonly obtained from soy, sunflower, or other natural sources. It is commonly used as an emulsifier to help ingredients mix together.",
     "purpose": "Used to stabilize mixtures and improve texture.",
     "source": "FDA - Food Additives"
   },
@@ -28,5 +28,17 @@
     "description": "Ascorbic acid is another name for vitamin C. In food products it can be used as an antioxidant and to help maintain product quality.",
     "purpose": "Used as an antioxidant and food-quality agent.",
     "source": "NIH - Vitamin C"
+  },
+  {
+    "name": "monosodium glutamate",
+    "description": "Monosodium glutamate (MSG) is a flavor enhancer used to provide umami taste in food products.",
+    "purpose": "Used as a flavor enhancer.",
+    "source": "FDA - Food Additives"
+  },
+  {
+    "name": "bha",
+    "description": "BHA (butylated hydroxyanisole) is an antioxidant used in some foods to help prevent fats and oils from becoming rancid.",
+    "purpose": "Used as an antioxidant to help maintain product stability.",
+    "source": "FDA - Food Additives"
   }
 ]

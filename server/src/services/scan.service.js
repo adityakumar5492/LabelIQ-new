@@ -4,11 +4,21 @@ const {
     parseNutritionMultiPass,
     validateNutrition,
 } = require("../ai/nutrition/nutrition.service");
+
+const {
+    readLabelFacts,
+} = require("../ai/extraction/label-facts.service");
+
+const {
+    reconcileNutrition,
+} = require("../ai/nutrition/nutrition-reconcile.service");
+
 const { getIngredientEvidence } = require("../ai/rag/rag.service");
 const {
     generateAiInsights,
 } = require("../ai/explanation/explanation.service");
 const ScanRawData = require("../models/scanRawData.model");
+const { createScanTimer, throwIfAborted } = require("../utils/scanTimer");
 const pool = require("../config/db");
 const {
     evaluateHealthRules,
@@ -224,142 +234,444 @@ const parseServingString = (text) => {
  * Added sugars are never invented: the parser does not extract them,
  * so the column stays null.
  */
-const buildNutrition = ({ ocrText, passes, extraction }) => {
+const buildNutrition = ({
+    ocrText,
+    passes,
+    extraction,
+    labelFacts = null,
+}) => {
     const warnings = [];
-    const text = typeof ocrText === "string" ? ocrText : "";
-    // ----- 1. deterministic parser -----
+
+    const text =
+        typeof ocrText === "string"
+            ? ocrText
+            : "";
+
+    const usablePasses =
+        Array.isArray(passes) && passes.length > 0
+            ? passes
+            : [
+                  {
+                      name: "ocr-text",
+                      text,
+                      words: [],
+                  },
+              ];
+
+    // --------------------------------------------------
+    // 1. Existing deterministic nutrition parser
+    // --------------------------------------------------
     let parsed = null;
+
     try {
-        const usablePasses =
-            Array.isArray(passes) && passes.length > 0
-                ? passes
-                : [{ name: "ocr-text", text, words: [] }];
         parsed = parseNutritionMultiPass(usablePasses);
     } catch (error) {
-        console.error("Nutrition table parsing failed:", error.message);
+        console.error(
+            "Nutrition table parsing failed:",
+            error.message
+        );
+
         warnings.push("table parser failed");
     }
-    const table = validateNutrition(parsed?.nutrition || {});
-    const tableBasis = normalizeBasis(parsed?.nutritionBasis);
-    const tableServing = normalizeServing(parsed?.servingSize);
-    const tableHasValues = NUTRIENT_KEYS.some((key) => table[key] !== null);
-    if (Array.isArray(parsed?.metadata?.warnings)) {
-        warnings.push(...parsed.metadata.warnings);
-    }
-    // ----- 2. AI values (fallback only) -----
-    const aiBasis = normalizeBasis(extraction?.nutritionBasis);
-    const aiServing = normalizeServing(extraction?.servingSize);
+
+    const validatedTable = validateNutrition(
+        parsed?.nutrition || {}
+    );
+
+    const tableBasis = normalizeBasis(
+        parsed?.nutritionBasis
+    );
+
+    const tableServing = normalizeServing(
+        parsed?.servingSize
+    );
+
+    // --------------------------------------------------
+    // 2. Prepare OCR texts for reconciliation
+    // --------------------------------------------------
+    const texts = [
+        text,
+        ...(Array.isArray(passes)
+            ? passes.map((pass) => pass?.text || "")
+            : []),
+    ].filter(Boolean);
+
+    // --------------------------------------------------
+    // 3. Prepare table evidence
+    // --------------------------------------------------
+    const table = {
+        values: {
+            calories: toNumberOrNull(
+                validatedTable.calories
+            ),
+
+            protein: toNumberOrNull(
+                validatedTable.protein
+            ),
+
+            carbohydrates: toNumberOrNull(
+                validatedTable.carbohydrates
+            ),
+
+            totalFat: toNumberOrNull(
+                validatedTable.totalFat
+            ),
+
+            saturatedFat: toNumberOrNull(
+                validatedTable.saturatedFat
+            ),
+
+            fiber: toNumberOrNull(
+                validatedTable.fiber
+            ),
+
+            sugar: toNumberOrNull(
+                validatedTable.sugar
+            ),
+
+            addedSugar: null,
+
+            sodium: toNumberOrNull(
+                validatedTable.sodium
+            ),
+        },
+
+        basis: tableBasis,
+
+        serving:
+            tableServing.value !== null
+                ? tableServing
+                : null,
+    };
+
+    // --------------------------------------------------
+    // 4. Prepare Groq evidence
+    // --------------------------------------------------
+    const aiBasis = normalizeBasis(
+        extraction?.nutritionBasis
+    );
+
+    const aiServing = normalizeServing(
+        extraction?.servingSize
+    );
+
     const aiNutrition =
-        extraction?.nutrition && typeof extraction.nutrition === "object"
+        extraction?.nutrition &&
+        typeof extraction.nutrition === "object"
             ? extraction.nutrition
             : {};
-    const aiValue = (key) => {
-        const value = toNumberOrNull(aiNutrition[key]);
-        if (value === null || value < 0) {
-            return null;
-        }
-        return NUTRIENT_EVIDENCE[key].test(text) ? value : null;
+
+    const ai = {
+        values: {
+            calories: toNumberOrNull(
+                aiNutrition.calories
+            ),
+
+            protein: toNumberOrNull(
+                aiNutrition.protein
+            ),
+
+            carbohydrates: toNumberOrNull(
+                aiNutrition.carbohydrates
+            ),
+
+            totalFat: toNumberOrNull(
+                aiNutrition.totalFat
+            ),
+
+            saturatedFat: toNumberOrNull(
+                aiNutrition.saturatedFat
+            ),
+
+            fiber: toNumberOrNull(
+                aiNutrition.fiber
+            ),
+
+            sugar: toNumberOrNull(
+                aiNutrition.sugar
+            ),
+
+            addedSugar: toNumberOrNull(
+                aiNutrition.addedSugar ??
+                aiNutrition.added_sugar ??
+                aiNutrition.added_sugars_g
+            ),
+
+            sodium: toNumberOrNull(
+                aiNutrition.sodium
+            ),
+        },
+
+        serving:
+            aiServing.value !== null
+                ? aiServing
+                : null,
+
+        basis: aiBasis,
     };
-    let basis = null;
-    let serving = tableServing;
-    let merged = { ...table };
-    let source = null;
-    const aiFilledFields = [];
-    if (tableBasis) {
-        basis = tableBasis;
-        if (tableHasValues) {
-            source = "table";
-        }
-        if (aiBasis === tableBasis && servingsCompatible(tableServing, aiServing)) {
-            const candidate = { ...table };
-            const filled = [];
-            for (const key of NUTRIENT_KEYS) {
-                if (candidate[key] !== null) {
-                    continue;
-                }
-                const value = aiValue(key);
-                if (value !== null) {
-                    candidate[key] = value;
-                    filled.push(key);
-                }
-            }
-            const validated = validateNutrition(candidate);
-            // Weak AI output must never destroy strong table evidence.
-            const tableValueLost = NUTRIENT_KEYS.some(
-                (key) => table[key] !== null && validated[key] === null
-            );
-            if (tableValueLost) {
-                warnings.push(
-                    "AI values conflicted with table values and were ignored"
-                );
-            } else {
-                merged = validated;
-                for (const key of filled) {
-                    if (merged[key] !== null) {
-                        aiFilledFields.push(key);
-                    }
-                }
-                if (aiFilledFields.length > 0) {
-                    source = tableHasValues ? "table+ai" : "ai";
-                }
-            }
-        }
-    } else if (aiBasis) {
-        // The table parser found no usable column.
-        const candidate = {};
-        for (const key of NUTRIENT_KEYS) {
-            candidate[key] = aiValue(key);
-        }
-        const validated = validateNutrition(candidate);
-        const filled = NUTRIENT_KEYS.filter((key) => validated[key] !== null);
-        if (filled.length > 0) {
-            basis = aiBasis;
-            merged = validated;
-            serving = aiServing;
-            source = "ai";
-            aiFilledFields.push(...filled);
-        }
+
+    // --------------------------------------------------
+    // 5. NEW nutrition reconciliation
+    // --------------------------------------------------
+    let reconciled = null;
+
+    try {
+        reconciled = reconcileNutrition({
+            texts,
+
+            servingCandidates:
+                labelFacts?.servingCandidates || [],
+
+            table,
+
+            ai,
+        });
+    } catch (error) {
+        console.error(
+            "Nutrition reconciliation failed:",
+            error.message
+        );
+
+        warnings.push(
+            "nutrition reconciliation failed"
+        );
     }
-    // Serving size is a label fact, independent of the nutrition column.
-    // Use the AI one only when the table parser did not find one.
-    if (serving.value === null && aiServing.value !== null) {
+
+    // --------------------------------------------------
+    // 6. Use reconciled values when evidence is strong
+    // --------------------------------------------------
+    if (reconciled?.active) {
+        const values = reconciled.values || {};
+
+        const serving =
+            reconciled.serving &&
+            Number.isFinite(
+                Number(reconciled.serving.value)
+            )
+                ? {
+                      value: Number(
+                          reconciled.serving.value
+                      ),
+                      unit:
+                          String(
+                              reconciled.serving.unit || ""
+                          ).toLowerCase(),
+                  }
+                : null;
+
+        const finalServing =
+            serving ||
+            tableServing ||
+            aiServing;
+
+        const nutrition = {
+            serving_size: formatServingSize(
+                finalServing
+            ),
+
+            calories:
+                toNumberOrNull(
+                    values.calories
+                ),
+
+            protein_g:
+                toNumberOrNull(
+                    values.protein
+                ),
+
+            carbohydrates_g:
+                toNumberOrNull(
+                    values.carbohydrates
+                ),
+
+            total_fat_g:
+                toNumberOrNull(
+                    values.totalFat
+                ),
+
+            saturated_fat_g:
+                toNumberOrNull(
+                    values.saturatedFat
+                ),
+
+            dietary_fiber_g:
+                toNumberOrNull(
+                    values.fiber
+                ),
+
+            total_sugars_g:
+                toNumberOrNull(
+                    values.sugar
+                ),
+
+            added_sugars_g:
+                toNumberOrNull(
+                    values.addedSugar
+                ),
+
+            sodium_mg:
+                toNumberOrNull(
+                    values.sodium
+                ),
+        };
+
+        // Preserve explicit salt -> sodium fallback
+        if (
+            nutrition.sodium_mg === null &&
+            validatedTable.salt !== null
+        ) {
+            nutrition.sodium_mg = round2(
+                validatedTable.salt *
+                    SALT_TO_SODIUM_MG_PER_G
+            );
+        }
+
+        if (Array.isArray(reconciled.notes)) {
+            warnings.push(
+                ...reconciled.notes
+            );
+        }
+
+        return {
+            nutrition,
+
+            meta: {
+                basis:
+                    tableBasis ||
+                    aiBasis ||
+                    null,
+
+                serving_size:
+                    finalServing?.value !== null
+                        ? finalServing
+                        : null,
+
+                source: "reconciled",
+
+                sodium_source:
+                    nutrition.sodium_mg !== null
+                        ? validatedTable.sodium !== null
+                            ? "label"
+                            : "reconciled"
+                        : null,
+
+                salt_g:
+                    validatedTable.salt ?? null,
+
+                ai_filled_fields: [],
+
+                verified_per_100:
+                    reconciled.verifiedPer100 ||
+                    {},
+
+                reconciliation_sources:
+                    reconciled.sources || {},
+
+                parser_warnings:
+                    warnings.slice(0, 20),
+            },
+        };
+    }
+
+    // --------------------------------------------------
+    // 7. SAFE fallback to existing parser
+    // --------------------------------------------------
+    let merged = {
+        ...validatedTable,
+    };
+
+    let serving = tableServing;
+
+    if (
+        serving.value === null &&
+        aiServing.value !== null
+    ) {
         serving = aiServing;
     }
-    // ----- 3. sodium / salt -----
-    const saltG = merged.salt;
+
     let sodiumMg = merged.sodium;
     let sodiumSource = null;
+
     if (sodiumMg !== null) {
         sodiumSource = "label";
-    } else if (saltG !== null) {
-        sodiumMg = round2(saltG * SALT_TO_SODIUM_MG_PER_G);
+    } else if (merged.salt !== null) {
+        sodiumMg = round2(
+            merged.salt *
+                SALT_TO_SODIUM_MG_PER_G
+        );
+
         sodiumSource = "salt";
     }
-    // ----- 4. final shape (same keys as nutrition_details) -----
+
     return {
         nutrition: {
-            serving_size: formatServingSize(serving),
-            calories: merged.calories,
-            protein_g: merged.protein,
-            carbohydrates_g: merged.carbohydrates,
-            total_fat_g: merged.totalFat,
-            saturated_fat_g: merged.saturatedFat,
-            dietary_fiber_g: merged.fiber,
-            total_sugars_g: merged.sugar,
-            // Not extracted by any parser. Never invented.
-            added_sugars_g: null,
-            sodium_mg: sodiumMg,
+            serving_size:
+                formatServingSize(serving),
+
+            calories:
+                merged.calories ?? null,
+
+            protein_g:
+                merged.protein ?? null,
+
+            carbohydrates_g:
+                merged.carbohydrates ?? null,
+
+            total_fat_g:
+                merged.totalFat ?? null,
+
+            saturated_fat_g:
+                merged.saturatedFat ?? null,
+
+            dietary_fiber_g:
+                merged.fiber ?? null,
+
+            total_sugars_g:
+                merged.sugar ?? null,
+
+            added_sugars_g:
+                toNumberOrNull(
+                    aiNutrition.addedSugar ??
+                    aiNutrition.added_sugar ??
+                    aiNutrition.added_sugars_g
+                ),
+
+            sodium_mg:
+                sodiumMg,
         },
-        // Stored in MongoDB (raw/unstructured side) next to the
-        // other extraction details. salt_g is kept as printed.
+
         meta: {
-            basis,
-            serving_size: serving.value !== null ? serving : null,
-            source,
-            sodium_source: sodiumSource,
-            salt_g: saltG,
-            ai_filled_fields: aiFilledFields,
-            parser_warnings: warnings.slice(0, 10),
+            basis:
+                tableBasis ||
+                aiBasis ||
+                null,
+
+            serving_size:
+                serving.value !== null
+                    ? serving
+                    : null,
+
+            source:
+                tableBasis
+                    ? "table"
+                    : aiBasis
+                      ? "ai"
+                      : null,
+
+            sodium_source:
+                sodiumSource,
+
+            salt_g:
+                merged.salt ?? null,
+
+            ai_filled_fields: [],
+
+            verified_per_100: {},
+
+            reconciliation_sources: {},
+
+            parser_warnings:
+                warnings.slice(0, 20),
         },
     };
 };
@@ -764,51 +1076,131 @@ const cloneForAi = (value) => {
 // ============================================
 // ANALYZE IMAGE
 // ============================================
-const analyzeImage = async (file, userId) => {
+// options (all optional): { signal: AbortSignal, timer }
+//   signal  aborted when the HTTP client disconnects, so a scan nobody is
+//           waiting for stops using CPU / Groq quota between stages.
+const analyzeImage = async (file, userId, options = {}) => {
+    const signal = options?.signal;
+    const timer = options?.timer || createScanTimer();
+
+    timer.log(
+        `upload received: ${file?.size ?? file?.buffer?.length ?? "?"} bytes`
+    );
+
     // ========================================
     // 1. RUN NODE AI PIPELINE
     // ========================================
     // Pipeline returns:
     // { ocr: { text }, ocrPasses, product, rag: { ingredients } }
-    const pipelineResult = await analyzeAIImage(file.buffer);
+    const pipelineResult = await analyzeAIImage(file.buffer, {
+        signal,
+        timer,
+    });
     const product = pipelineResult?.product;
     if (!product) {
         throw new Error("AI analysis data not found");
     }
     // ========================================
+// LABEL FACTS
+// Deterministic facts from every OCR pass
+// ========================================
+const labelTexts = [
+    pipelineResult.ocr?.text || "",
+    ...(Array.isArray(pipelineResult.ocrPasses)
+        ? pipelineResult.ocrPasses.map(
+              (pass) => pass?.text || ""
+          )
+        : []),
+].filter(Boolean);
+
+const labelFacts = readLabelFacts({
+    texts: labelTexts,
+    groq: product,
+});
+    // ========================================
     // 2. NUTRITION
     //    deterministic table parser first,
     //    validated Groq values only as fallback
     // ========================================
-    const { nutrition, meta: nutritionMeta } = buildNutrition({
-        ocrText: pipelineResult.ocr?.text || "",
-        passes: pipelineResult.ocrPasses,
-        extraction: product,
-    });
+    const nutritionDone = timer.stage("nutrition parse");
+    const {
+    nutrition,
+    meta: nutritionMeta,
+} = buildNutrition({
+    ocrText:
+        pipelineResult.ocr?.text || "",
+
+    passes:
+        pipelineResult.ocrPasses,
+
+    extraction:
+        product,
+
+    labelFacts,
+});
+    nutritionDone();
     // ========================================
     // 3. BUILD aiData IN THE SHAPE THE REST OF
     //    THE FLOW (MongoDB, API response) EXPECTS
     // ========================================
     // Ingredients are cleaned ONCE here, so MongoDB, PostgreSQL and
     // the API response all contain exactly the same list and order.
-    const ingredientList = cleanIngredientList(product.ingredients);
-    // Product identity: product_name, brand, variant.
+const ingredientList = cleanIngredientList(
+    labelFacts?.ingredients?.length
+        ? labelFacts.ingredients
+        : product.ingredients
+);    // Product identity: product_name, brand, variant.
     // Pack information: pack_size, servings_per_container.
     // Every value comes from extraction only. Missing stays null.
     const aiAnalysis = {
-        product_name: product.product_name || product.name || null,
-        brand: cleanText(product.brand),
-        variant: cleanText(product.variant),
-        pack_size: buildPackSize(product.packSize),
-        servings_per_container: toServingsPerContainer(
+    product_name:
+        product.product_name ||
+        product.name ||
+        null,
+
+    brand:
+        cleanText(product.brand),
+
+    variant:
+        cleanText(product.variant),
+
+    // Prefer deterministic label facts.
+    pack_size:
+        buildPackSize(
+            labelFacts?.packSize ||
+            product.packSize
+        ),
+
+    // Prefer deterministic label facts.
+    servings_per_container:
+        toServingsPerContainer(
+            labelFacts?.servingsPerPack ??
             product.servingsPerContainer
         ),
-        ingredients: ingredientList,
-        allergens: product.allergens || [],
-        nutrition,
-        // Nutrition basis, source and sodium/salt details.
-        nutrition_meta: nutritionMeta,
-    };
+
+    // Prefer deterministic ingredient extraction.
+    ingredients:
+        labelFacts?.ingredients?.length
+            ? labelFacts.ingredients
+            : ingredientList,
+
+    // Keep confirmed and may-contain allergens separate.
+    allergens:
+        labelFacts?.allergens ||
+        product.allergens ||
+        [],
+
+    nutrition,
+
+    // Nutrition basis, source, sodium/salt details
+    // plus deterministic label-fact notes.
+    nutrition_meta: {
+        ...nutritionMeta,
+
+        label_facts_notes:
+            labelFacts?.notes || [],
+    },
+};
     // AI insights (Groq explanation) are generated further down,
     // AFTER the deterministic rule engine has finished, because
     // they only explain its results. Never used for
@@ -821,9 +1213,12 @@ const analyzeImage = async (file, userId) => {
         },
         ai_insights: {},
     };
+    // Nobody is waiting any more: do not write a scan to the database.
+    throwIfAborted(signal);
     // ========================================
     // 4. START TRANSACTION
     // ========================================
+    const dbDone = timer.stage("PostgreSQL transaction");
     const client = await pool.connect();
     // The connection is released right after COMMIT so it is not
     // held while waiting for Groq.
@@ -997,12 +1392,14 @@ const analyzeImage = async (file, userId) => {
         // ====================================
         // 9. RUN RULE ENGINE (source of truth)
         // ====================================
+        const rulesDone = timer.stage("health rules");
         const ruleResult = await runIngredientRules(
             client,
             savedProduct.id,
             analysis.id,
             userId
         );
+        rulesDone();
         // ====================================
         // 10. CREATE ASSESSMENT
         // ====================================
@@ -1053,6 +1450,7 @@ const analyzeImage = async (file, userId) => {
         // uses the pool (or no database at all).
         client.release();
         released = true;
+        dbDone();
         // ====================================
         // 14. DERIVED (NOT STORED) GROUP 2 DATA
         // ====================================
@@ -1102,6 +1500,7 @@ const analyzeImage = async (file, userId) => {
         // Groq receives independent COPIES, so nothing it (or the
         // explanation code) does can change the score, grade,
         // penalties or rule matches that are returned below.
+        const explanationDone = timer.stage("Groq explanation");
         try {
             aiData.ai_insights = await generateAiInsights(
                 cloneForAi({
@@ -1122,21 +1521,25 @@ const analyzeImage = async (file, userId) => {
             console.error("AI insights failed:", error.message);
             aiData.ai_insights = {};
         }
+        explanationDone();
         // ====================================
         // 16. SAVE RAW DATA TO MONGODB
         // ====================================
         //
         // Saved AFTER the explanation so ai_insights is stored and
         // GET /scan/:id returns the same text as the new scan.
+        const mongoDone = timer.stage("MongoDB save");
         await saveRawScanData({
             scanId: savedProduct.id,
             userId,
             filename: file.originalname,
             aiData,
         });
+        mongoDone();
         // ====================================
         // 17. RETURN FINAL RESULT
         // ====================================
+        timer.total(`scanId=${savedProduct.id}`);
         return {
             ...aiData,
             ai_analysis: {

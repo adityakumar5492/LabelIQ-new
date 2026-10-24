@@ -3,6 +3,13 @@
 const { extractOCR } = require("../ocr/ocr.service");
 const { extractProductInfo } = require("../extraction/extraction.service");
 const { getIngredientEvidence } = require("../rag/rag.service");
+const { parseNutritionMultiPass } = require("../nutrition/nutrition.service");
+const { createScanTimer, throwIfAborted } = require("../../utils/scanTimer");
+
+// Groq only needs a couple of distinct full-image views, not every OCR
+// pass (the old prompt contained ~9 copies of the label text).
+const MAX_PROMPT_EXTRA_PASSES = 2;
+const MAX_PROMPT_EXTRA_CHARS = 6000;
 
 /**
  * Normalize OCR output so the rest of the pipeline always receives:
@@ -156,6 +163,110 @@ function buildAdditionalOcrText(passes) {
         .join("\n\n");
 }
 
+
+/**
+ * Decides when OCR has produced enough evidence to stop running passes.
+ *
+ * It does NOT judge accuracy; it detects convergence: OCR stops once
+ *   - a nutrition basis and at least 3 nutrients were parsed,
+ *   - the passes do not disagree (no voting conflicts),
+ *   - the label has an ingredient section in the OCR text, and
+ *   - the LAST pass changed nothing in the merged nutrition result.
+ * When that never happens (poor photo), every pass still runs, inside the
+ * OCR time budget, exactly as before.
+ *
+ * Returns a stateful function: create one per scan.
+ */
+function createOcrSufficiencyCheck() {
+    let lastSignature = null;
+
+    return function isSufficient(passes) {
+        const usable = (passes || []).filter(
+            (p) => p && typeof p.text === "string" && p.text.trim()
+        );
+
+        if (!usable.length) {
+            return false;
+        }
+
+        const parsed = parseNutritionMultiPass(
+            usable.map((p) => ({
+                name: p.name,
+                text: p.text,
+                words: Array.isArray(p.words) ? p.words : [],
+            }))
+        );
+
+        const signature = JSON.stringify([
+            parsed.nutritionBasis,
+            parsed.servingSize,
+            parsed.nutrition,
+        ]);
+
+        const stable = signature === lastSignature;
+
+        lastSignature = signature;
+
+        const filled = Object.values(parsed.nutrition || {}).filter(
+            (v) => v !== null && v !== undefined
+        ).length;
+
+        const conflicts = (parsed.metadata && parsed.metadata.conflicts) || [];
+        const hasIngredients = usable.some((p) => /ingredient/i.test(p.text));
+
+        return Boolean(
+            parsed.nutritionBasis &&
+                filled >= 3 &&
+                conflicts.length === 0 &&
+                hasIngredients &&
+                stable
+        );
+    };
+}
+
+function normalizeForCompare(text) {
+    return String(text || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Evidence text that is sent to Groq.
+ *
+ * The full evidence (every pass) is still used locally to validate what
+ * Groq returns; only the PROMPT is trimmed:
+ *   - the primary pass is already sent as the main OCR text
+ *   - table-crop passes only contain the nutrition table, which is parsed
+ *     deterministically, so they are not sent
+ *   - identical / near-identical passes are sent once
+ */
+function buildPromptEvidence(passes, primaryText) {
+    const seen = new Set([normalizeForCompare(primaryText)]);
+    const chosen = [];
+
+    for (const pass of passes || []) {
+        if (chosen.length >= MAX_PROMPT_EXTRA_PASSES) {
+            break;
+        }
+
+        const name = typeof pass.name === "string" ? pass.name : "";
+        const text = typeof pass.text === "string" ? pass.text.trim() : "";
+
+        if (!text || name.startsWith("table-crop")) {
+            continue;
+        }
+
+        const key = normalizeForCompare(text);
+
+        if (seen.has(key)) {
+            continue;
+        }
+
+        seen.add(key);
+        chosen.push(`--- OCR PASS: ${name || "pass"} ---\n${text}`);
+    }
+
+    return chosen.join("\n\n").slice(0, MAX_PROMPT_EXTRA_CHARS);
+}
+
 /**
  * Main Node.js AI pipeline.
  *
@@ -179,10 +290,13 @@ function buildAdditionalOcrText(passes) {
  * - Deterministic health rules remain outside this pipeline.
  * - AI does NOT determine the health score or grade.
  */
-async function analyzeImage(imageBuffer) {
+async function analyzeImage(imageBuffer, options = {}) {
     if (!imageBuffer) {
         throw new Error("Image buffer is required");
     }
+
+    const signal = options.signal;
+    const timer = options.timer || createScanTimer();
 
     // --------------------------------------------------
     // 1. MULTI-PASS OCR
@@ -195,11 +309,23 @@ async function analyzeImage(imageBuffer) {
     // - word coordinates
     // - bounding boxes
     //
+    throwIfAborted(signal);
+
+    const ocrDone = timer.stage("OCR");
+
     const rawOcr = await extractOCR(imageBuffer, {
         multiPass: true,
+        // Stop running extra passes once the result has converged.
+        isSufficient: createOcrSufficiencyCheck(),
+        // One Tesseract worker for the whole server (no per-scan startup).
+        reuseWorker: true,
+        signal,
+        log: timer.log,
     });
 
     const ocr = normalizeOcrOutput(rawOcr);
+
+    ocrDone(`${ocr.passes.length} passes`);
 
     const ocrText = ocr.text;
 
@@ -231,6 +357,9 @@ async function analyzeImage(imageBuffer) {
     const additionalOcrText =
         buildAdditionalOcrText(ocr.passes);
 
+    // Smaller text for the Groq prompt only (see buildPromptEvidence).
+    const promptEvidence = buildPromptEvidence(ocr.passes, ocrText);
+
     // --------------------------------------------------
     // 3. PRODUCT / INGREDIENT EXTRACTION
     // --------------------------------------------------
@@ -251,10 +380,21 @@ async function analyzeImage(imageBuffer) {
     //
     // Groq must NOT determine the final health score.
     //
+    throwIfAborted(signal);
+
+    const extractionDone = timer.stage("Groq extraction");
+
     const product = await extractProductInfo(
         ocrText,
-        additionalOcrText
+        additionalOcrText,
+        {
+            promptEvidence,
+            signal,
+            log: timer.log,
+        }
     );
+
+    extractionDone();
 
     if (!product || typeof product !== "object") {
         throw new Error("Product extraction failed");
@@ -272,6 +412,7 @@ async function analyzeImage(imageBuffer) {
     // - personalized penalties
     // - dietary safety
     //
+    const ragDone = timer.stage("RAG");
     const ingredientEvidence = [];
 
     for (const ingredient of product.ingredients || []) {
@@ -302,6 +443,8 @@ async function analyzeImage(imageBuffer) {
         });
     }
 
+    ragDone(`${ingredientEvidence.length} ingredients`);
+
     // --------------------------------------------------
     // 5. FINAL PIPELINE RESULT
     // --------------------------------------------------
@@ -331,4 +474,8 @@ async function analyzeImage(imageBuffer) {
 
 module.exports = {
     analyzeImage,
+
+    // Exported for tests.
+    createOcrSufficiencyCheck,
+    buildPromptEvidence,
 };

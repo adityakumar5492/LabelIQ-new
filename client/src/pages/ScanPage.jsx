@@ -117,6 +117,21 @@ export default function ScanPage() {
 
 
   // ==========================================================
+  // WAKE UP THE BACKEND
+  // ==========================================================
+  //
+  // The API runs on Render, which puts an idle service to sleep. The
+  // first request after a pause can spend a long time just starting the
+  // server. This cheap request starts that while the user is still
+  // choosing a photo, so the scan itself does not pay for it.
+  // Failure is irrelevant, so it is ignored.
+
+  useEffect(() => {
+    api.get("/health", { timeout: 70000 }).catch(() => {});
+  }, []);
+
+
+  // ==========================================================
   // STOP CAMERA WHEN LEAVING CAMERA TAB
   // ==========================================================
 
@@ -629,7 +644,10 @@ export default function ScanPage() {
 
           maxBodyLength: Infinity,
 
-          timeout: 120000,
+          // Safety net only. The backend now bounds its own work
+          // (OCR budget + Groq timeouts, under 3 minutes in the
+          // very worst case) and a normal scan takes seconds.
+          timeout: 180000,
         }
       );
 

@@ -2,10 +2,24 @@
 
 const scanService = require("../services/scan.service");
 const historyService = require("../services/history.service");
+const { createScanTimer } = require("../utils/scanTimer");
 
 const MAX_PRODUCT_NAME_LENGTH = 255;
 
 const scanProduct = async (req, res) => {
+    const timer = createScanTimer();
+
+    // If the browser gives up (timeout, closed tab, Retry) the scan must
+    // stop: otherwise the abandoned scan keeps burning CPU and Groq quota
+    // while the retried scan waits behind it.
+    const abortController = new AbortController();
+
+    res.on("close", () => {
+        if (!res.writableEnded) {
+            abortController.abort();
+        }
+    });
+
     try {
         if (!req.file) {
             return res.status(400).json({
@@ -16,7 +30,8 @@ const scanProduct = async (req, res) => {
 
         const result = await scanService.analyzeImage(
             req.file,
-            req.user.userId
+            req.user.userId,
+            { signal: abortController.signal, timer }
         );
 
         return res.status(200).json({
@@ -25,9 +40,23 @@ const scanProduct = async (req, res) => {
             data: result,
         });
     } catch (error) {
+        if (error?.code === "SCAN_ABORTED") {
+            timer.log(`cancelled after ${timer.elapsed()} ms (client disconnected)`);
+
+            return;
+        }
+
+        timer.log(`FAILED after ${timer.elapsed()} ms: ${error.message}`);
         console.error("Scan product error:", error);
 
-        return res.status(500).json({
+        // 429 / 503 come from the AI provider (rate limit / unavailable);
+        // everything else stays a plain 500 as before.
+        const status =
+            error?.statusCode === 429 || error?.statusCode === 503
+                ? error.statusCode
+                : 500;
+
+        return res.status(status).json({
             success: false,
             message: error.message || "Failed to analyze image",
         });
